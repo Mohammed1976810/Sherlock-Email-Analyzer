@@ -1,0 +1,29 @@
+# Sherlock v10.1 - Enterprise Forensic Email Analyzer
+# Core dependencies (required)
+streamlit>=1.28.0
+pandas>=2.0.0
+requests>=2.31.0
+beautifulsoup4>=4.12.0
+
+# Optional: Enhanced regex with timeout support (ReDoS protection)
+regex>=2023.0
+
+# Optional: Email security analysis
+dnspython>=2.4.0
+python-whois>=0.9.0
+
+# Optional: Attachment analysis
+oletools>=0.60
+yara-python>=4.3.0
+
+# Optional: PDF analysis
+pdfminer.six>=20221105
+
+# Optional: Image forensics
+Pillow>=10.0.0
+pyzbar>=0.1.9
+stegano>=0.11.0
+pytesseract>=0.3.10
+
+# Optional: PDF report export
+reportlab>=4.0.0
