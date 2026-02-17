@@ -1,132 +1,107 @@
-# Sherlock - Enterprise Forensic Email Analyzer
+# Sherlock - Enterprise Forensic Email Analyzer v10.0
 
-**v9.0 (Security Hardened)** — A complete, production-grade forensic email analysis tool built with Streamlit.
+**Signal-based nonlinear scoring engine** for forensic email analysis. Every detection module produces structured `ThreatSignal` objects that feed into a probability-combination engine with correlation bonuses, trust dampening, and signal hierarchy enforcement.
 
-## What It Does
+## Architecture: Why v10 Is Different
 
-Sherlock analyzes `.eml` email files and produces a comprehensive forensic report covering:
+Previous versions used **additive scoring** — each finding added points, features existed but didn't meaningfully contribute to the verdict, and findings didn't align with the final result.
 
-- **Email Authentication** — SPF, DKIM, DMARC verification with live DNS checks
-- **Sender Identity** — Display name spoofing, shadow spoofing, return-path mismatch detection
-- **URL/Domain Analysis** — VirusTotal multi-engine scanning, WHOIS enrichment, typosquatting detection
-- **Link-Text Mismatch Detection** — Detects `<a href="evil.com">bank.com</a>` phishing patterns
-- **Attachment Forensics** — YARA behavioral rules, MalwareBazaar hash matching, macro analysis (OleTools)
-- **PDF Deep Inspection** — Embedded URI extraction, JavaScript/Launch action detection
-- **Office Link Extraction** — Deep inspection of `.docx/.xlsx/.pptx` relationship files
-- **BEC Detection** — Wire transfer, gift card, CEO impersonation, payment redirect patterns
-- **IP Reputation** — AbuseIPDB scoring with TOR exit node detection
-- **Image Forensics** — QR code extraction, steganography detection, tracking pixel identification
-- **Header Anomaly Detection** — Reply-To hijacking, timezone inconsistencies, hop count analysis
-- **Smart Threat Narrative** — Attack pattern classification with per-signal analyst explanations
+v10 uses a **signal-based architecture** where:
+
+1. **Every module produces `ThreatSignal` objects** with a threat probability (0-1) and confidence (0-1)
+2. **Signals combine nonlinearly**: `P = 1 - prod(1 - p_i * c_i)` — diminishing returns are built in
+3. **Correlation bonuses** amplify co-occurring signals (e.g., SPF fail + display name spoof)
+4. **Trust factors** dampen threat probability (gateway trust, DKIM pass, known sender)
+5. **Signal hierarchy** enforces floors — hard evidence (malware hash, VT consensus) guarantees minimum severity
+6. The **verdict maps directly to the combined probability**, so findings always explain the result
+
+### Signal Tiers
+
+| Tier | Type | Example | Effect |
+|------|------|---------|--------|
+| 1 | Hard Evidence | Malware hash, VT ≥5 engines, YARA critical | Minimum 72% threat |
+| 2 | Strong Signal | SPF fail, shadow spoofing, display name spoof | Combined normally |
+| 3 | Heuristic | BEC keywords, suspicious language, high entropy URL | Combined normally |
+| 4 | Contextual | URL shortener, suspicious TLD, header anomaly | Combined normally |
+
+### Verdict Mapping
+
+| Score | Verdict | Action |
+|-------|---------|--------|
+| 0-17 | CLEAN | Release |
+| 18-39 | REVIEW | Deliver with warning |
+| 40-64 | SUSPICIOUS | Hold for manual review |
+| 65-84 | LIKELY MALICIOUS | Quarantine |
+| 85-100 | MALICIOUS | Block immediately |
+
+## Smart Features
+
+### Text Processing
+- **BeautifulSoup** DOM parsing extracts only visible text (skips `display:none`, scripts, styles)
+- **Unicode de-obfuscation** normalizes Cyrillic/Greek confusables and collapses noise characters (`P.a.y.P.a.l` → `PayPal`)
+
+### URL Intelligence
+- **Path entropy analysis** — high entropy URL paths (e.g., `domain.com/8f7a9c2b3d...`) indicate phishing tokens
+- **Tracking domain allowlist** — suppresses false positives from SendGrid, Mailchimp, Proofpoint SafeLinks, etc.
+- **Suspicious TLD detection** — flags `.xyz`, `.top`, `.tk` and 30+ frequently-abused TLDs
+
+### Sender Memory
+- **SQLite database** tracks first-seen dates for sender domains
+- Known senders (seen >30 days ago) get automatic trust dampening
+- Reduces false positives on recurring correspondents
+
+### PDF Forensics
+- **pdfminer.six** decompresses PDF streams before searching for URIs (regex-only missed compressed objects)
+- Regex fallback for non-standard PDFs
+
+### Image Analysis
+- **OCR via pytesseract** extracts text from image attachments and feeds it into BEC/keyword scanners
+- Detects image-based phishing that bypasses text filters
+
+### BEC Detection
+- **Linguistic density** measures BEC keywords relative to total word count
+- **Contradiction detection** halves BEC score when urgency words conflict with calm language ("urgent" + "no rush")
+- Expanded keyword sets: wire transfer, gift cards, urgency, secrecy, authority claims, payment redirects
+
+### Macro Analysis
+- **Trusts MacroRaptor** verdict instead of redundant manual keyword grep
+- Entropy analysis as supplementary check only
+- YARA scanning on extracted VBA code
+
+### Hop Timing
+- Parses Received header timestamps and calculates inter-hop delays
+- Flags stalling relays (>15 min delay) which indicate compromised servers or greylisting
+
+### Future Date Tolerance
+- Increased from 1 day to 3 days to reduce false positives from misconfigured mail servers
 
 ## Quick Start
 
 ```bash
-# Install dependencies
 pip install -r requirements.txt
-
-# Configure API keys (optional but recommended)
 cp .streamlit/secrets.toml.example .streamlit/secrets.toml
-# Edit .streamlit/secrets.toml with your keys
-
-# Run the analyzer
+# Edit secrets.toml with your API keys (optional)
 streamlit run sherlock_analyzer.py
 ```
 
-## API Keys
+## API Keys (Optional)
 
-All API keys are **optional**. The analyzer works without them but with reduced capability:
+| Service | Purpose | Free Tier |
+|---------|---------|-----------|
+| [VirusTotal](https://www.virustotal.com/gui/join-us) | Multi-engine URL/domain/IP scanning | 4 req/min |
+| [AbuseIPDB](https://www.abuseipdb.com/register) | Source IP reputation | 1000/day |
+| [MalwareBazaar](https://bazaar.abuse.ch/) | Known malware hash matching | Unlimited |
 
-| Service | Purpose | Free Tier | Required? |
-|---------|---------|-----------|-----------|
-| [VirusTotal](https://www.virustotal.com/gui/join-us) | URL/domain/IP multi-engine scanning | 4 req/min | No |
-| [AbuseIPDB](https://www.abuseipdb.com/register) | Source IP reputation scoring | 1000 checks/day | No |
-| [MalwareBazaar](https://bazaar.abuse.ch/) | Known malware hash matching | Unlimited | No |
-
-Without API keys, the analyzer still provides:
-- Full email authentication analysis (SPF/DKIM/DMARC)
-- YARA behavioral scanning (9 built-in rules)
-- Macro analysis (OleTools)
-- BEC pattern detection
-- Header anomaly detection
-- Link-text mismatch detection
-- Display name spoof detection
-- Attachment risk matrix
-- WHOIS/DNS domain intelligence
-
-## Architecture
-
-### Scoring System
-
-The analyzer uses a weighted scoring system (0-100) with these categories:
-
-| Category | Weight | Description |
-|----------|--------|-------------|
-| SPF FAIL | 60 | Unauthorized sending server |
-| SPF SOFTFAIL | 30 | Partially unauthorized sender |
-| DMARC FAIL | 50 | Domain policy violation |
-| DKIM FAIL | 40 | Message integrity compromised |
-| Shadow Spoofing | 70 | From/Return-Path domain mismatch |
-| Display Name Spoof | 55 | Brand impersonation in display name |
-| Link-Text Mismatch | 35 | Displayed URL differs from actual link |
-| Malware (YARA Critical) | 80 | Behavioral pattern match |
-| MalwareBazaar Hit | 90 | Confirmed known malware hash |
-| BEC Critical | 70 | Wire transfer + urgency patterns |
-| AbuseIPDB High | 60 | High-abuse source IP |
-
-### Verdict Thresholds
-
-| Score | Verdict | Action |
-|-------|---------|--------|
-| 0-19 | CLEAN | Release |
-| 20-49 | REVIEW RECOMMENDED | Soft quarantine |
-| 50-79 | SUSPICIOUS | Hold for review |
-| 80-99 | LIKELY MALICIOUS | Quarantine |
-| 100 | MALICIOUS | Block immediately |
-
-### Mitigation Credits
-
-Trusted gateways (Mimecast, Proofpoint, Microsoft O365, Cisco IronPort, Barracuda) and passing authentication reduce the score, but **never** override hard threat signals like confirmed malware, malicious VT consensus, or critical YARA matches.
-
-## Security Fixes (v8.1 → v9.0)
-
-- **[CRITICAL]** Fixed `calculate_entropy` — was using `float.bit_length()` which crashes with `AttributeError`
-- **[CRITICAL]** Fixed `SecurePatterns` staticmethod compatibility for Python < 3.10
-- **[CRITICAL]** Removed duplicate dead-code loop in `analyze_attachment_risks`
-- **[CRITICAL]** Removed debug comments left in production code
-- **[CRITICAL]** Fixed `safe_regex_search` timeout handling on compiled patterns
-- **[ACCURACY]** Added SPF softfail/temperror/permerror handling (previously ignored)
-- **[ACCURACY]** Added DKIM NONE compounding with SPF failures
-- **[ACCURACY]** Fixed typosquatting detection with Levenshtein edit distance and homoglyph detection
-- **[ACCURACY]** Added HTML `<a href>` link extraction (primary phishing vector was missed)
-- **[ACCURACY]** Added link-text mismatch detection (`<a href="evil.com">bank.com</a>`)
-- **[ACCURACY]** Capped `total_score` at 100 to prevent overflow
-- **[ACCURACY]** Expanded MIME type validation (added .doc, .xls, .rar, .csv, .txt, etc.)
-- **[ACCURACY]** Expanded dangerous extensions (added .wsf, .msi, .com, .lnk, etc.)
-- **[ACCURACY]** Expanded double extension patterns (16 patterns, up from 4)
-- **[ACCURACY]** Added received chain hop analysis
-- **[ACCURACY]** Added CEO/CFO authority claim detection in BEC engine
-- **[ACCURACY]** Added URL shortener detection
-- **[ACCURACY]** Added suspicious TLD flagging
-- **[ACCURACY]** Subject line now included in suspicious language analysis
-- **[ACCURACY]** Fixed marketing platform return-path matching (exact domain, not substring)
-- **[COMPLETE]** Complete text/PDF report now includes all finding categories
-- **[CONSIST]** Consistent scoring, error handling, and threat level mapping throughout
-
-## Optional Dependencies
-
-Some features require system-level packages:
+## System Dependencies (Optional)
 
 ```bash
-# For QR code scanning (requires libzbar)
-# Ubuntu/Debian:
-sudo apt-get install libzbar0
+# OCR support
+sudo apt-get install tesseract-ocr  # Ubuntu/Debian
+brew install tesseract               # macOS
 
-# macOS:
-brew install zbar
-
-# For YARA rules
-pip install yara-python
+# QR code scanning
+sudo apt-get install libzbar0       # Ubuntu/Debian
+brew install zbar                    # macOS
 ```
 
 ## License
