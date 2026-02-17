@@ -145,8 +145,31 @@ PAT_PDF_URI = _rcb(rb'/URI\s*\(([^)]{4,500})\)')
 PAT_PDF_URL = _rcb(rb'https?://[^\s\x00<>(){}\[\]"\'\\]{10,300}')
 
 # ── Keyword / classification sets ────────────────────────────────────────────
-GOVERNMENT_TLDS  = {'.gov','.gov.uk','.gov.au','.gov.ca','.mil'}
-EDUCATIONAL_TLDS = {'.edu','.ac.uk','.edu.au'}
+GOVERNMENT_TLDS  = {
+    '.gov','.gov.uk','.gov.au','.gov.ca','.gov.nz','.gov.za','.gov.in',
+    '.gov.sg','.gov.ae','.gov.eg','.gov.sa','.gov.qa','.gov.om',
+    '.gov.bh','.gov.kw','.gov.jo','.gov.lb','.gov.iq','.gov.il',
+    '.gov.br','.gov.mx','.gov.co','.gov.ar','.gov.cl','.gov.pk',
+    '.gov.ng','.gov.ke','.gov.gh','.gov.my','.gov.ph','.gov.tw',
+    '.gov.hk','.gov.cn','.gov.jp','.gov.kr','.gov.th','.gov.vn',
+    '.gov.bd','.gov.lk','.gov.np','.gov.mm',
+    '.mil','.mil.uk','.mil.au','.mil.ca',
+    '.gc.ca','.gob.mx','.gob.ar','.gob.cl','.gob.pe','.gob.es',
+    '.go.jp','.go.kr','.go.th','.go.ke','.go.tz','.go.id',
+    '.gouv.fr','.gouv.ci','.gouv.sn','.gouv.ml',
+    '.govt.nz','.government.nl',
+}
+EDUCATIONAL_TLDS = {
+    '.edu','.edu.au','.edu.cn','.edu.hk','.edu.tw','.edu.sg',
+    '.edu.my','.edu.ph','.edu.pk','.edu.in','.edu.eg','.edu.sa',
+    '.edu.ae','.edu.qa','.edu.om','.edu.bh','.edu.jo','.edu.lb',
+    '.edu.br','.edu.mx','.edu.co','.edu.ar','.edu.cl',
+    '.edu.ng','.edu.za','.edu.ke','.edu.gh',
+    '.ac.uk','.ac.nz','.ac.za','.ac.in','.ac.jp','.ac.kr',
+    '.ac.th','.ac.id','.ac.ir','.ac.il','.ac.ae','.ac.ke',
+    '.ac.tz','.ac.ug','.ac.rw','.ac.bd','.ac.lk','.ac.cn',
+    '.uni.edu','.university',
+}
 MAJOR_TECH = {'google.com','microsoft.com','apple.com','amazon.com',
               'github.com','linkedin.com','facebook.com','twitter.com'}
 
@@ -866,9 +889,38 @@ def _vt_consensus(stats, detailed=None, is404=False, dom=""):
     return r
 
 def check_vt(kind, value):
+    """Check observable with VT. ALWAYS runs domain_intel() first for local
+    classification (gov/edu/tech/typosquat/WHOIS) even without an API key."""
     c = _vt_cache(); cached = c.get(f"{kind}:{value}")
     if cached: return cached
-    if not Config.VT_KEY: return VTResult(error="No API key")
+
+    # Always extract domain for local intel
+    dom = ""
+    if kind == 'url':
+        try: dom = urlparse(value).netloc
+        except: pass
+    elif kind == 'domain':
+        dom = value
+
+    # Run local domain intelligence FIRST (no API needed)
+    di = domain_intel(dom) if dom else None
+
+    if not Config.VT_KEY:
+        # No API key — return local intel only
+        r = VTResult(success=True, error="No API key")
+        r.domain_intel = di
+        if di and di.trusted:
+            r.threat_level = "CLEAN"
+            r.reasoning = f"No VT API — Local intel: {di.reasoning}"
+        elif di and di.typosquat:
+            r.threat_level = "SUSPICIOUS"
+            r.reasoning = f"No VT API — {di.typosquat}"
+        else:
+            r.threat_level = "UNKNOWN"
+            r.reasoning = f"No VT API — {di.reasoning if di else 'no local intel'}"
+        c.put(f"{kind}:{value}", r)
+        return r
+
     try:
         _vt_lim.wait()
         h = {"x-apikey": Config.VT_KEY}
@@ -879,7 +931,6 @@ def check_vt(kind, value):
             resp = requests.get(f"https://www.virustotal.com/api/v3/domains/{value}", headers=h, timeout=HTTP_TIMEOUT)
         else:
             resp = requests.get(f"https://www.virustotal.com/api/v3/ip_addresses/{value}", headers=h, timeout=HTTP_TIMEOUT)
-        dom = urlparse(value).netloc if kind=='url' else (value if kind=='domain' else '')
         if resp.status_code==200:
             a = resp.json().get('data',{}).get('attributes',{})
             r = _vt_consensus(a.get('last_analysis_stats',{}), a.get('last_analysis_results',{}), False, dom)
@@ -887,10 +938,13 @@ def check_vt(kind, value):
             r = _vt_consensus({},{},True,dom)
         else:
             r = VTResult(error=f"HTTP {resp.status_code}")
+            r.domain_intel = di  # attach local intel even on HTTP errors
         c.put(f"{kind}:{value}", r)
         return r
     except Exception as e:
-        return VTResult(error=str(e)[:80])
+        r = VTResult(error=str(e)[:80])
+        r.domain_intel = di  # attach local intel even on exceptions
+        return r
 
 def check_abuseipdb(ip):
     if not ip or not Config.ABUSE_KEY: return {}
@@ -1855,6 +1909,7 @@ def analyze_email(msg_bytes, status_fn, progress_fn):
     to_check = [o for o in observables if o.type in ('url','domain','ip')][:MAX_OBS]
     if to_check:
         total = len(to_check); done = 0
+        status_fn(f"Scanning {total} observable(s) with VirusTotal...", "🔍")
         with ThreadPoolExecutor(max_workers=4) as ex:
             futs = {ex.submit(check_vt, o.type, o.value): o for o in to_check}
             for f in as_completed(futs):
@@ -1866,16 +1921,23 @@ def analyze_email(msg_bytes, status_fn, progress_fn):
                         elif o.vt.threat_level=='SUSPICIOUS': o.threat_score=50; o.reputation='suspicious'
                         else: o.reputation='clean'
                 except: pass
+                # Update status text with current observable result
+                tl = o.vt.threat_level if (o.vt and o.vt.success) else "..."
+                icon = _ti(tl) if tl != "..." else "🔍"
+                status_fn(f"[{done}/{total}] {o.type}: {o.defanged[:45]} → {icon} {tl}", "🔍")
                 progress_fn(32 + int(done/total*28))
+    else:
+        status_fn("No observables to scan", "ℹ️")
     progress_fn(62)
 
     # ── Attachments ───────────────────────────────────────────────────────────
-    status_fn("Scanning attachments...", "📎")
+    status_fn("Scanning attachments (YARA + Macros + Forensics)...", "📎")
     macros = []
     for part in msg.walk():
         if part.get_content_maintype()=='multipart': continue
         fname = part.get_filename()
         if not fname: continue
+        status_fn(f"Analyzing: {fname}", "📎")
         try:
             data = part.get_payload(decode=True)
             if not data: continue
@@ -1883,6 +1945,8 @@ def analyze_email(msg_bytes, status_fn, progress_fn):
             macros.append(macro)
             # Scan embedded URIs — tag source by file type
             uri_source = 'pdf_uri' if macro.file_type == 'PDF' else 'office_link'
+            if macro.pdf_uris:
+                status_fn(f"Scanning {len(macro.pdf_uris)} embedded URI(s) from {fname}...", "🔗")
             for u in macro.pdf_uris:
                 if u.startswith('http'):
                     uo = Observable(type='url',value=u,defanged=defang(u),source=uri_source)
@@ -1909,11 +1973,13 @@ def analyze_email(msg_bytes, status_fn, progress_fn):
     progress_fn(80)
 
     # ── Images + OCR ──────────────────────────────────────────────────────────
-    status_fn("Image forensics + OCR...", "🖼️")
+    status_fn("Performing image forensics + OCR...", "🖼️")
     images = []
     ocr_bec_hits = 0
     for part in msg.walk():
         if part.get_content_type().startswith('image/'):
+            img_fname = part.get_filename() or "image"
+            status_fn(f"Scanning image: {img_fname}", "🖼️")
             try:
                 img = analyze_image(part)
                 if img:
