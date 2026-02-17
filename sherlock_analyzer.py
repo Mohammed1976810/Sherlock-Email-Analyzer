@@ -1222,8 +1222,9 @@ def analyze_attachment(data, filename) -> MacroResult:
     # YARA
     yara_hits = _yara_scan(data, filename)
     is_valid_office = data[:4]==b'PK\x03\x04' and b'[Content_Types].xml' in data
+    is_zip_file = filename.lower().endswith(('.zip','.rar','.7z','.gz','.tar'))
     for m in yara_hits:
-        if m['rule']=='Archive_Sig' and is_valid_office: continue
+        if m['rule']=='Archive_Sig' and (is_valid_office or is_zip_file): continue
         r.yara_matches.append(m)
     if r.yara_matches:
         sev_score = {'CRITICAL':80,'HIGH':50,'MEDIUM':25}
@@ -1512,13 +1513,14 @@ def generate_signals(auth, anomalies, reply_hijack, bec, spoof_result, spoof_dn,
     if sus_tld:
         sigs.append(ThreatSignal('suspicious_tld','content',4, 0.18, 0.65,
             f"{len(sus_tld)} Suspicious TLD(s)","Frequently-abused TLD",""))
-    high_entropy_urls = [o for o in observables if o.type=='url' and o.path_entropy > 4.0]
+    high_entropy_urls = [o for o in observables if o.type=='url' and o.path_entropy > 4.8]
     if high_entropy_urls:
         sigs.append(ThreatSignal('high_entropy_url','content',3, 0.25, 0.60,
             "High-Entropy URL Path","Likely phishing token",
             f"Entropy={high_entropy_urls[0].path_entropy:.1f}"))
 
-    # ── Observables (VT results) ──────────────────────────────────────────────
+    # ── Observables (VT results) — consolidated clean trust ─────────────────
+    vt_clean_count = 0
     for o in observables:
         if o.vt and o.vt.success:
             if o.vt.threat_level in ('CRITICAL','MALICIOUS'):
@@ -1529,8 +1531,11 @@ def generate_signals(auth, anomalies, reply_hijack, bec, spoof_result, spoof_dn,
                 sigs.append(ThreatSignal(f'vt_sus_{o.value[:20]}','network',3, 0.35, 0.65,
                     f"VT: {o.type} suspicious", o.vt.reasoning, o.defanged))
             elif o.vt.threat_level in ('CLEAN','LOW'):
-                trust.append(TrustFactor(f'vt_clean_{o.value[:20]}', 0.03, 0.70,
-                    f"VT clean: {o.defanged[:40]}"))
+                vt_clean_count += 1
+    # Single consolidated trust factor for all clean VT results
+    if vt_clean_count > 0:
+        trust.append(TrustFactor('vt_clean_urls', min(0.15, vt_clean_count * 0.02), 0.75,
+            f"{vt_clean_count} URL(s)/domain(s) verified clean by VirusTotal"))
     # Typosquat
     for o in observables:
         if o.vt and o.vt.domain_intel and o.vt.domain_intel.typosquat:
@@ -1900,7 +1905,7 @@ def analyze_email(msg_bytes, status_fn, progress_fn):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# STREAMLIT UI
+# REASONING CARD GENERATOR
 # ═══════════════════════════════════════════════════════════════════════════════
 
 DC = {
@@ -1909,6 +1914,7 @@ DC = {
     'elev':'#2d3748','border':'#334155','accent':'#38bdf8','purple':'#8b5cf6',
     'text1':'#e2e8f0','text2':'#94a3b8','ok':'#10b981','warn':'#f59e0b','err':'#ef4444',
 }
+SHADOW = '0 4px 6px -1px rgba(0,0,0,0.3)'
 
 def _tc(level):
     return {'CRITICAL':DC['critical'],'MALICIOUS':DC['critical'],'HIGH':DC['high'],
@@ -1919,244 +1925,638 @@ def _ti(level):
     return {'CRITICAL':'🚨','MALICIOUS':'🚨','HIGH':'⚠️','SUSPICIOUS':'⚠️',
             'MEDIUM':'⚠️','LOW':'📋','CLEAN':'✅','SAFE':'✅'}.get((level or '').upper(),'❓')
 
+def _card(icon, title, body, detail, color):
+    """Render a single reasoning card (matching v9 design)."""
+    body_html = re.sub(r'\*\*(.+?)\*\*', r'<b>\1</b>', _esc(body))
+    return (
+        f"<div style='background:linear-gradient(135deg,{DC['card']},{DC['elev']});"
+        f"border:1px solid {color}44;border-left:4px solid {color};"
+        f"border-radius:10px;padding:14px 16px;margin:6px 0;box-shadow:{SHADOW}'>"
+        f"<div style='font-weight:700;color:{color};margin-bottom:6px;font-size:.95em'>"
+        f"{icon} {_esc(title)}</div>"
+        f"<div style='color:{DC['text1']};font-size:.88em;margin-bottom:6px;line-height:1.5'>"
+        f"{body_html}</div>"
+        f"<div style='color:{DC['text2']};font-size:.76em;border-top:1px solid {DC['border']};"
+        f"padding-top:5px;margin-top:4px'>{_esc(detail[:160])}</div></div>"
+    )
+
+def build_reasoning_cards(R):
+    """Build analytical reasoning cards from report data — explains WHAT IT MEANS."""
+    cards = []
+    auth = R['auth']
+    sigs = R['signals']
+    sig_names = {s.name for s in sigs}
+
+    # 1. Sender Identity
+    if auth.shadow_spoof and R.get('spoof'):
+        cards.append(('👤','Sender Identity',
+            f"🚨 **Double identity deception** — display name impersonation AND Return-Path "
+            f"routes replies to **{auth.rp_domain}** instead of **{auth.from_domain}**. "
+            f"The recipient sees a trusted name; replies go to the attacker.",
+            f"From: {auth.from_full[:70]} | Return-Path: {auth.rp_domain}", DC['critical']))
+    elif auth.shadow_spoof:
+        cards.append(('👤','Sender Identity',
+            f"⚠️ **Return-Path mismatch** — email appears from **{auth.from_domain}** "
+            f"but replies route to **{auth.rp_domain}**.",
+            f"From: {auth.from_full[:70]}", DC['critical']))
+    elif R.get('spoof'):
+        cards.append(('👤','Sender Identity',
+            f"🚨 **Display name impersonation** — {R['spoof']}",
+            f"Domain: {R.get('spoof_sd','')}", DC['high']))
+    else:
+        cards.append(('👤','Sender Identity',
+            f"✅ **Sender identity consistent** — From, Return-Path, and envelope all "
+            f"align to **{auth.from_domain or 'unknown'}**. No identity deception detected.",
+            f"From: {auth.from_full[:70]}", DC['ok']))
+
+    # 2. Authentication
+    if auth.spf=='FAIL' and auth.dmarc=='FAIL':
+        abody = ("🚨 **Authentication failure** — SPF confirms unauthorized sender, "
+                 "DMARC violation means domain policy breached. Strongest spoofing signal.")
+        acol = DC['critical']
+    elif auth.spf=='FAIL':
+        abody = f"⚠️ **Unauthorized sender** — server NOT in **{auth.from_domain}**'s SPF record."
+        acol = DC['critical']
+    elif auth.spf=='SOFTFAIL':
+        abody = f"⚠️ **SPF softfail** — sender not fully authorized by **{auth.from_domain}**."
+        acol = DC['warn']
+    elif auth.spf=='PASS' and auth.dkim=='PASS' and auth.dmarc=='PASS':
+        abody = "✅ **Full authentication chain intact** — SPF, DKIM, and DMARC all pass."
+        acol = DC['ok']
+    elif auth.spf=='PASS' and auth.dkim=='PASS':
+        abody = "✅ **SPF + DKIM pass** — sender verified, message unmodified."
+        acol = DC['ok']
+    else:
+        abody = f"SPF: {auth.spf} | DKIM: {auth.dkim} | DMARC: {auth.dmarc}"
+        acol = DC['accent']
+    if auth.gateway_trust:
+        abody += f" 🛡️ Trusted gateway **{auth.gateway_name}** pre-screened this message."
+    det = ""
+    if auth.live_verified:
+        sp = auth.live_spf.get('status','—'); dm = auth.live_dmarc.get('status','—')
+        dp = auth.live_dmarc.get('policy','')
+        det = f"Live DNS — SPF: {sp} | DMARC: {dm}" + (f" (policy={dp})" if dp else "")
+    else:
+        det = "Live DNS offline — install dnspython for verification"
+    cards.append(('🔐','Authentication & DNS', abody, det, acol))
+
+    # 3. Source IP
+    abuse = R.get('abuse_data',{})
+    if auth.source_ip and abuse:
+        ascore = abuse.get('abuseConfidenceScore',0)
+        if ascore >= 75:
+            cards.append(('🌐','Source IP Reputation',
+                f"🚨 **High-confidence malicious IP** — {abuse.get('totalReports',0)} abuse reports, "
+                f"{ascore}/100 AbuseIPDB." + (" **TOR exit node.**" if abuse.get('isTor') else ""),
+                f"ISP: {abuse.get('isp','—')} | Country: {abuse.get('countryCode','—')}",
+                DC['critical']))
+        elif ascore >= 40:
+            cards.append(('🌐','Source IP Reputation',
+                f"⚠️ **Elevated risk** — {abuse.get('totalReports',0)} reports ({ascore}/100).",
+                f"ISP: {abuse.get('isp','—')}", DC['high']))
+        else:
+            cards.append(('🌐','Source IP Reputation',
+                f"✅ **IP clean** — {ascore}/100 across 90-day lookback. No abuse history.",
+                f"ISP: {abuse.get('isp','—')} | Country: {abuse.get('countryCode','—')}", DC['ok']))
+    elif auth.source_ip:
+        cards.append(('🌐','Source IP Reputation',
+            f"ℹ️ **No reputation data** for {auth.source_ip} — add abuseipdb_key for scoring.",
+            "Add abuseipdb_key to secrets.toml", DC['accent']))
+
+    # 4. Link-Text Mismatches
+    ltms = R.get('link_mismatches',[])
+    real_ltm = [m for m in ltms if not m.is_tracking]
+    if real_ltm:
+        cards.append(('🔗','Link-Text Mismatches',
+            f"🚨 **{len(real_ltm)} mismatch(es)** — displayed domain differs from actual link. "
+            f"Classic phishing technique: victim sees a trusted name but clicks a malicious link.",
+            f"e.g. Shows '{real_ltm[0].display_domain}' → links to '{real_ltm[0].href_domain}'",
+            DC['critical']))
+
+    # 5. Attachments
+    real_att = [m for m in R['macros'] if m.filename != '[Body]']
+    if real_att:
+        mb = sum(1 for m in real_att if m.mb_found)
+        yr = sum(len(m.yara_matches) for m in real_att)
+        risks = len(R.get('attachment_risks',[]))
+        if mb:
+            fam = next((m.mb_family for m in real_att if m.mb_found),'Unknown')
+            cards.append(('📎','Attachments',
+                f"🚨 **Confirmed malware** — SHA256 matches MalwareBazaar: **{fam}**. "
+                f"Quarantine immediately.", f"{len(real_att)} file(s) scanned", DC['critical']))
+        elif yr:
+            top = next((y['rule'] for m in real_att for y in m.yara_matches),'')
+            cards.append(('📎','Attachments',
+                f"⚠️ **YARA match** — {yr} rule(s) fired, top: **{top}**.",
+                f"{len(real_att)} file(s)", DC['high']))
+        elif risks:
+            cards.append(('📎','Attachments',
+                f"⚠️ **{risks} structural risk(s)** — deceptive file structure detected.",
+                f"{len(real_att)} file(s)", DC['warn']))
+        else:
+            cards.append(('📎','Attachments',
+                f"✅ **All {len(real_att)} attachment(s) clean** — YARA, MalwareBazaar, "
+                f"macro analysis all clear.", "", DC['ok']))
+
+    # 6. URLs & Domains
+    url_obs = [o for o in R['observables'] if o.type in ('url','domain') and o.vt]
+    if url_obs:
+        threats = [o for o in url_obs if o.vt.threat_level in ('CRITICAL','MALICIOUS')]
+        clean = [o for o in url_obs if o.vt.threat_level in ('CLEAN','LOW')]
+        if threats:
+            cards.append(('🌍','URLs & Domains',
+                f"🚨 **{len(threats)} malicious URL(s)** confirmed by VirusTotal.",
+                f"{len(url_obs)} scanned", DC['critical']))
+        elif len(clean) == len(url_obs):
+            cards.append(('🌍','URLs & Domains',
+                f"✅ **All {len(clean)} URL(s) verified clean** by VirusTotal consensus.",
+                f"{len(url_obs)} scanned", DC['ok']))
+        else:
+            cards.append(('🌍','URLs & Domains',
+                f"📊 **{len(url_obs)} observable(s)** scanned — {len(threats)} threats, "
+                f"{len(clean)} clean.", "", DC['accent']))
+
+    # 7. BEC
+    bec = R.get('bec')
+    if bec and bec.score >= 0.25:
+        cats = bec.categories
+        if 'wire_transfer' in cats and 'urgency' in cats:
+            bbody = "🚨 **Classic wire fraud** — urgent wire transfer language detected."
+        elif 'gift_cards' in cats:
+            bbody = "🚨 **Gift card scam** — requests for gift card purchases."
+        elif 'payment_redirect' in cats:
+            bbody = "🚨 **Payment redirect** — bank details change requested."
+        else:
+            bbody = bec.summary
+        bcol = DC['critical'] if bec.score >= 0.6 else DC['high']
+        cards.append(('🎯','BEC / Social Engineering', bbody,
+            f"Score: {bec.score:.0%} | Categories: {', '.join(cats)}", bcol))
+
+    # 8. Scan Coverage
+    total_obs = len(R['observables'])
+    vt_ok = sum(1 for o in R['observables'] if o.vt and o.vt.success)
+    cards.append(('📊','Scan Coverage',
+        f"📊 **{total_obs} observables** analyzed — VT: {vt_ok}/{total_obs} | "
+        f"**{len(R['macros'])}** file(s) scanned by YARA + MalwareBazaar.",
+        f"AbuseIPDB: {'active' if abuse else 'not configured'} | "
+        f"{'YARA active' if YARA_OK else 'YARA offline'}", DC['accent']))
+
+    return cards
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# STREAMLIT UI
+# ═══════════════════════════════════════════════════════════════════════════════
+
 def main():
     st.set_page_config(page_title="Sherlock v10.0", layout="wide", page_icon="🔍")
     st.markdown(f"""<style>
-.main{{background:linear-gradient(135deg,{DC['bg']},#1a1f2e)}}
-.stProgress>div>div>div>div{{background:linear-gradient(90deg,{DC['accent']},{DC['purple']});border-radius:10px}}
-.stTabs [data-baseweb="tab-list"]{{gap:4px;background:{DC['card']};padding:6px;border-radius:8px}}
-.stTabs [aria-selected="true"]{{background:linear-gradient(135deg,{DC['accent']},{DC['purple']})}}
+.main{{background:linear-gradient(135deg,{DC['bg']} 0%,#1a1f2e 100%)}}
+.stProgress > div > div > div > div{{background-image:linear-gradient(90deg,{DC['accent']},{DC['purple']},{DC['high']});border-radius:10px}}
+.stTabs [data-baseweb="tab-list"]{{gap:6px;background:{DC['card']};padding:8px;border-radius:10px}}
+.stTabs [data-baseweb="tab"]{{border-radius:8px;padding:10px 18px}}
+.stTabs [aria-selected="true"]{{background:linear-gradient(135deg,{DC['accent']},{DC['purple']});box-shadow:0 0 20px rgba(59,130,246,0.3)}}
+[data-testid="stMetricValue"]{{font-size:2em;font-weight:700;background:linear-gradient(135deg,{DC['accent']},{DC['purple']});-webkit-background-clip:text;-webkit-text-fill-color:transparent}}
 </style>""", unsafe_allow_html=True)
 
-    st.title("🔍 SHERLOCK v10.0 — Signal-Based Forensic Email Analyzer")
-    st.caption("Nonlinear scoring · Correlation engine · BeautifulSoup · OCR · Sender memory · pdfminer")
+    st.title("🔍 SHERLOCK — FORENSIC EMAIL ANALYZER")
+    st.caption("v10.0 | Signal-Based Nonlinear Scoring · Correlation Engine · BeautifulSoup · OCR · Sender Memory")
 
     if 'report' not in st.session_state: st.session_state.report = None
     if 'fhash' not in st.session_state: st.session_state.fhash = None
 
     with st.sidebar:
         st.markdown("### 📧 Upload Email")
-        up = st.file_uploader("Select .eml", type=['eml'])
+        up = st.file_uploader("Select .eml file", type=['eml'])
         if up:
             fb = up.getvalue(); fh = hashlib.md5(fb).hexdigest()
             sz = len(fb)/(1024*1024)
-            if sz > 50: st.error("File too large"); st.stop()
-            st.success(f"✅ {sz:.2f} MB")
+            if sz > 50: st.error("❌ File too large"); st.stop()
+            st.success(f"✅ Loaded ({sz:.2f} MB)")
             if st.session_state.fhash != fh:
                 st.session_state.fhash = fh; st.session_state.report = None
         st.divider()
-        st.markdown("### Module Status")
-        for name, ok in [("BeautifulSoup",BS4_OK),("OleTools",OLETOOLS_OK),("YARA",YARA_OK),
-                         ("pdfminer",PDFMINER_OK),("OCR",OCR_OK),("PIL",PIL_OK),
-                         ("WHOIS",WHOIS_OK),("VT API",bool(Config.VT_KEY)),("AbuseIPDB",bool(Config.ABUSE_KEY))]:
-            st.metric(name, "✅" if ok else "⚠️")
+        st.markdown("### ✅ Module Status")
+        for name, ok in [("BeautifulSoup",BS4_OK),("OleTools",OLETOOLS_OK),
+                         ("YARA (9 rules)",YARA_OK),("pdfminer",PDFMINER_OK),
+                         ("OCR",OCR_OK),("PIL (Image)",PIL_OK),
+                         ("WHOIS",WHOIS_OK),("VirusTotal",bool(Config.VT_KEY)),
+                         ("AbuseIPDB",bool(Config.ABUSE_KEY))]:
+            st.metric(name, "✅ Online" if ok else "⚠️ Offline")
 
     if not up:
-        st.info("👆 Upload an .eml file")
+        st.info("👆 Upload an .eml file to begin analysis")
         c1,c2,c3 = st.columns(3)
-        c1.markdown("**🧠 Signal Engine**\n- Nonlinear scoring\n- Correlation bonuses\n- Trust dampening")
-        c2.markdown("**🔍 Smart Detection**\n- BeautifulSoup parsing\n- Text de-obfuscation\n- URL path entropy")
-        c3.markdown("**📊 Complete Analysis**\n- OCR image text\n- pdfminer streams\n- Sender memory")
+        with c1:
+            st.markdown("**🧠 Signal Engine**\n- Nonlinear scoring\n- Correlation bonuses\n- Signal hierarchy")
+        with c2:
+            st.markdown("**🔍 Smart Detection**\n- BeautifulSoup parsing\n- Text de-obfuscation\n- Link-text mismatch")
+        with c3:
+            st.markdown("**📊 Complete Analysis**\n- OCR image text\n- pdfminer PDF streams\n- Sender memory")
         return
 
     try:
         if st.session_state.report is None:
             pb = st.progress(0); sc = st.empty()
-            def _s(m,i,c=None): sc.markdown(f"<div style='border-left:3px solid {c or DC['accent']};padding:8px 12px;margin:4px 0;background:{(c or DC['accent'])}15;border-radius:4px'><b>{i}</b> {_esc(m)}</div>", unsafe_allow_html=True)
+            accent = DC['accent']
+            def _s(m, i, c=None):
+                cl = c or accent
+                sc.markdown(
+                    f"<div style='background:linear-gradient(90deg,{cl}22,transparent);"
+                    f"border-left:4px solid {cl};padding:12px 16px;border-radius:6px;"
+                    f"margin:8px 0;box-shadow:{SHADOW}'>"
+                    f"<span style='font-size:1.1em;margin-right:8px'>{i}</span>"
+                    f"<span style='color:{DC['text1']};font-weight:500'>{_esc(m)}</span></div>",
+                    unsafe_allow_html=True)
             t0 = time.time()
             st.session_state.report = analyze_email(fb, _s, pb.progress)
             sc.empty(); pb.empty()
-            st.success(f"✅ Analysis done in {time.time()-t0:.1f}s")
+            st.success(f"✅ Analysis complete in {time.time()-t0:.1f}s")
 
         R = st.session_state.report
         txt = generate_text_report(R)
 
         # ── Verdict banner ────────────────────────────────────────────────
         tc = _tc(R['threat_level']); ti = _ti(R['threat_level'])
-        st.markdown(f"""<div style='background:linear-gradient(135deg,{DC['card']},{DC['elev']});padding:20px;
-            border-radius:12px;margin:16px 0;border-left:5px solid {tc}'>
-            <h2 style='margin:0;color:{DC['text1']}'>{ti} {_esc(R['verdict'])}</h2>
-            <p style='margin:8px 0 0;color:{DC['text2']}'>
-            Score: <b style='color:{tc}'>{R['score']}/100</b> |
-            Threat: <b>{_esc(R['threat_level'])}</b> |
-            Confidence: {R['confidence']}% |
-            Signals: {len(R['signals'])} | Trust: {len(R['trust_factors'])}</p>
-            <p style='margin:4px 0 0;color:{DC['text2']};font-size:.85em'>{_esc(R['explanation'])}</p>
-            </div>""", unsafe_allow_html=True)
+        action = "✅ RELEASE" if R['score'] < 18 else ("🔍 REVIEW" if R['score'] < 40 else ("⚠️ HOLD" if R['score'] < 65 else "⛔ QUARANTINE"))
+        ac = DC['ok'] if R['score']<18 else (DC['accent'] if R['score']<40 else (DC['warn'] if R['score']<65 else DC['critical']))
+        st.markdown(
+            f"<div style='background:linear-gradient(135deg,{DC['card']},{DC['elev']});"
+            f"padding:24px;border-radius:12px;margin:16px 0;border-left:6px solid {tc};"
+            f"box-shadow:0 10px 15px -3px rgba(0,0,0,0.4)'>"
+            f"<div style='display:flex;align-items:center;gap:14px;flex-wrap:wrap;margin-bottom:10px'>"
+            f"<h2 style='margin:0;color:{DC['text1']}'>{ti} Verdict: {_esc(R['verdict'])}</h2>"
+            f"<span style='background:{ac};color:#fff;padding:6px 14px;border-radius:20px;"
+            f"font-weight:700;font-size:.9em'>{action}</span></div>"
+            f"<p style='margin:0;color:{DC['text2']};font-size:1.05em'>"
+            f"<b>Score:</b> <span style='color:{tc};font-weight:700'>{R['score']}/100</span> | "
+            f"<b>Threat:</b> {_esc(R['threat_level'])} | "
+            f"<b>Confidence:</b> {R['confidence']}%</p></div>",
+            unsafe_allow_html=True)
 
-        tabs = st.tabs(["📋 Signals & Reasoning","🔐 Authentication","🌐 URLs & Domains",
+        tabs = st.tabs(["📋 Report & Intelligence","🔐 Authentication","🌐 URLs & Domains",
                          "📎 Attachments","🔴 YARA","🖼️ Images","📊 All Findings","💾 Export"])
 
-        # ── Tab 1: Signals ────────────────────────────────────────────────
+        # ══════════════════════════════════════════════════════════════════
+        # TAB 1: Report & Intelligence (reasoning cards + key signals)
+        # ══════════════════════════════════════════════════════════════════
         with tabs[0]:
-            st.subheader("🧠 Threat Signals (sorted by impact)")
-            if R['signals']:
-                for s in sorted(R['signals'], key=lambda x: x.probability*x.confidence, reverse=True):
+            # Section: Reasoning Cards
+            st.markdown(
+                f"<div style='background:linear-gradient(135deg,{DC['card']},{DC['elev']});"
+                f"border:2px solid {DC['purple']};border-left:6px solid {DC['purple']};"
+                f"border-radius:12px;padding:16px 20px;margin:12px 0'>"
+                f"<div style='font-size:1.2em;font-weight:700;color:{DC['purple']}'>🧠 REASONING</div>"
+                f"<div style='color:{DC['text2']};font-size:.85em'>"
+                f"Analytical insights — <em>what it means, not just what was found</em></div></div>",
+                unsafe_allow_html=True)
+
+            try:
+                reason_cards = build_reasoning_cards(R)
+            except Exception as e:
+                log.error(f"Reasoning cards: {e}"); reason_cards = []
+
+            for i in range(0, len(reason_cards), 2):
+                cols = st.columns(2)
+                for j, col in enumerate(cols):
+                    if i + j < len(reason_cards):
+                        ic, ti_c, body, det, clr = reason_cards[i + j]
+                        with col:
+                            st.markdown(_card(ic, ti_c, body, det, clr), unsafe_allow_html=True)
+
+            # Section: Key Threat Signals (top 5 only, human-readable)
+            threat_sigs = sorted(R['signals'], key=lambda x: x.probability*x.confidence, reverse=True)
+            if threat_sigs:
+                st.markdown(
+                    f"<div style='background:linear-gradient(135deg,{DC['card']},{DC['elev']});"
+                    f"border:2px solid {DC['accent']};border-left:6px solid {DC['accent']};"
+                    f"border-radius:12px;padding:16px 20px;margin:16px 0'>"
+                    f"<div style='font-size:1.2em;font-weight:700;color:{DC['accent']}'>🎯 KEY SIGNALS</div>"
+                    f"<div style='color:{DC['text2']};font-size:.85em'>"
+                    f"Top threat signals driving the verdict — per-signal explanation</div></div>",
+                    unsafe_allow_html=True)
+
+                for s in threat_sigs[:6]:
                     eff = s.probability * s.confidence
-                    c = DC['critical'] if eff>=0.5 else (DC['high'] if eff>=0.25 else (DC['warn'] if eff>=0.1 else DC['text2']))
-                    st.markdown(f"""<div style='border-left:4px solid {c};background:{c}15;padding:12px;margin:6px 0;border-radius:6px'>
-                        <div style='display:flex;justify-content:space-between;flex-wrap:wrap'>
-                        <b style='color:{c}'>[T{s.tier}/{s.category}] {_esc(s.title)}</b>
-                        <span style='background:{c};color:#fff;padding:2px 8px;border-radius:10px;font-size:.75em'>
-                        p={s.probability:.0%} × c={s.confidence:.0%} = {eff:.0%}</span></div>
-                        <div style='color:{DC["text1"]};font-size:.88em;margin-top:4px'>{_esc(s.detail)}</div>
-                        {'<div style="color:'+DC["text2"]+';font-size:.78em;margin-top:2px">'+_esc(s.evidence)+'</div>' if s.evidence else ''}
-                        </div>""", unsafe_allow_html=True)
+                    if eff >= 0.4: sc = DC['critical']; sev = "CRITICAL"
+                    elif eff >= 0.2: sc = DC['high']; sev = "HIGH"
+                    elif eff >= 0.08: sc = DC['warn']; sev = "MEDIUM"
+                    else: sc = DC['text2']; sev = "LOW"
+                    st.markdown(
+                        f"<div style='background:{DC['bg']}88;border-radius:8px;padding:12px 14px;"
+                        f"margin:8px 0;border-left:4px solid {sc}'>"
+                        f"<div style='display:flex;justify-content:space-between;align-items:flex-start;"
+                        f"flex-wrap:wrap;gap:6px'>"
+                        f"<span style='font-weight:700;color:{sc};font-size:.95em'>{_esc(s.title)}</span>"
+                        f"<span style='background:{sc};color:#fff;padding:2px 10px;border-radius:10px;"
+                        f"font-size:.72em;font-weight:700;white-space:nowrap'>{sev} ({eff:.0%})</span></div>"
+                        f"<div style='color:{DC['text2']};font-size:.85em;margin-top:5px'>"
+                        f"<span style='color:{DC['border']}'>Why: </span>{_esc(s.detail)}</div>"
+                        f"{'<div style=\"color:'+DC['text2']+';font-size:.78em;margin-top:2px;font-style:italic\">'+_esc(s.evidence)+'</div>' if s.evidence else ''}"
+                        f"</div>",
+                        unsafe_allow_html=True)
             else:
-                st.success("✅ No threat signals")
+                st.success("✅ No threat signals detected — email appears clean")
 
-            if R['trust_factors']:
-                st.subheader("🛡️ Trust Factors")
-                for t in R['trust_factors']:
-                    st.markdown(f"<div style='border-left:3px solid {DC['ok']};padding:8px 12px;margin:4px 0;background:{DC['ok']}15;border-radius:4px'>"
-                                f"<b style='color:{DC['ok']}'>✓ {_esc(t.name)}</b> strength={t.strength:.0%} — {_esc(t.description)}</div>", unsafe_allow_html=True)
+            # Section: Mitigating Factors (trust + correlations)
+            if R['trust_factors'] or R.get('correlations'):
+                st.markdown(
+                    f"<div style='background:linear-gradient(135deg,{DC['card']},{DC['elev']});"
+                    f"border:2px solid {DC['ok']};border-left:6px solid {DC['ok']};"
+                    f"border-radius:12px;padding:16px 20px;margin:16px 0'>"
+                    f"<div style='font-size:1.2em;font-weight:700;color:{DC['ok']}'>✅ MITIGATING FACTORS</div>"
+                    f"<div style='color:{DC['text2']};font-size:.85em'>"
+                    f"Positive signals that reduce the threat score</div></div>",
+                    unsafe_allow_html=True)
 
-            if R['correlations']:
-                st.subheader("🔗 Correlations Applied")
-                for c in R['correlations']: st.info(c)
-            if R['dampening']:
-                st.subheader("⬇️ Dampening Applied")
-                for d in R['dampening']: st.caption(d)
+                for tf in R['trust_factors']:
+                    st.markdown(
+                        f"<div style='background:{DC['card']};border:1px solid {DC['ok']}44;"
+                        f"border-left:5px solid {DC['ok']};border-radius:8px;padding:12px 16px;"
+                        f"margin:6px 0;display:flex;align-items:center;gap:12px'>"
+                        f"<span style='background:{DC['ok']};color:#fff;border-radius:4px;"
+                        f"padding:2px 8px;font-weight:700;font-size:.82em'>✓</span>"
+                        f"<span style='color:{DC['text1']};font-size:.92em'>{_esc(tf.description)}"
+                        f" <span style='color:{DC['text2']};font-size:.82em'>"
+                        f"(dampening: {tf.strength:.0%})</span></span></div>",
+                        unsafe_allow_html=True)
 
-        # ── Tab 2: Auth ───────────────────────────────────────────────────
+                if R.get('correlations'):
+                    st.markdown(f"**🔗 Signal Correlations Applied:**")
+                    for c in R['correlations']:
+                        st.markdown(
+                            f"<div style='background:{DC['accent']}12;border-left:3px solid {DC['accent']};"
+                            f"border-radius:6px;padding:8px 12px;margin:4px 0;color:{DC['text1']};"
+                            f"font-size:.88em'>{_esc(c)}</div>",
+                            unsafe_allow_html=True)
+
+            # Analyst recommendation
+            score = R['score']
+            if score >= 65:
+                note = "⛔ **QUARANTINE** — Block delivery. Investigate sender and any clicked links."
+                nc = DC['critical']
+            elif score >= 40:
+                note = "⚠️ **HOLD FOR REVIEW** — Do not deliver without manual analyst review."
+                nc = DC['warn']
+            elif score >= 18:
+                note = "🔍 **DELIVER WITH CAUTION** — Soft quarantine or add warning banner."
+                nc = DC['accent']
+            else:
+                note = "✅ **RELEASE** — No significant threats. Safe for delivery."
+                nc = DC['ok']
+            note_html = re.sub(r'\*\*(.+?)\*\*', r'<b>\1</b>', _esc(note))
+            st.markdown(
+                f"<div style='background:{nc}15;border-left:4px solid {nc};border-radius:8px;"
+                f"padding:14px 18px;margin:16px 0'>"
+                f"<div style='font-weight:700;color:{nc};margin-bottom:4px'>📋 Analyst Recommendation</div>"
+                f"<div style='color:{DC['text1']};font-size:.95em'>{note_html}</div></div>",
+                unsafe_allow_html=True)
+
+            # Email metadata
+            with st.expander("📋 Email Metadata & Hashes"):
+                meta = R.get('metadata',{})
+                hashes = R.get('hashes',{})
+                mc1, mc2 = st.columns(2)
+                with mc1:
+                    st.markdown(f"**From:** `{_esc(meta.get('from','—')[:80])}`")
+                    st.markdown(f"**Subject:** `{_esc(meta.get('subject','—')[:80])}`")
+                    st.markdown(f"**Date:** `{_esc(meta.get('date','—')[:60])}`")
+                with mc2:
+                    st.markdown(f"**MD5:** `{hashes.get('md5','—')}`")
+                    st.markdown(f"**SHA256:** `{hashes.get('sha256','—')}`")
+
+        # ══════════════════════════════════════════════════════════════════
+        # TAB 2: Authentication
+        # ══════════════════════════════════════════════════════════════════
         with tabs[1]:
-            st.subheader("🔐 Authentication")
+            st.subheader("🔐 Email Authentication")
             auth = R['auth']
             c1,c2,c3,c4 = st.columns(4)
             for col, lbl, val in [(c1,"SPF",auth.spf),(c2,"DKIM",auth.dkim),(c3,"DMARC",auth.dmarc),(c4,"Hops",str(auth.hop_count))]:
-                col.metric(lbl, val)
-            if auth.gateway_trust: st.success(f"🛡️ Gateway: {auth.gateway_name}")
-            if auth.shadow_spoof: st.error(f"🚨 Shadow spoof: {auth.from_domain} vs {auth.rp_domain}")
-            if auth.hop_anomaly: st.warning(auth.hop_anomaly)
+                delta = "Valid" if val=="PASS" else ("Issue" if val in ("FAIL","SOFTFAIL") else "")
+                dcol = "normal" if val=="PASS" else ("inverse" if val in ("FAIL","SOFTFAIL") else "off")
+                col.metric(lbl, val, delta=delta, delta_color=dcol)
+            if auth.gateway_trust:
+                st.success(f"🛡️ **Trusted Gateway:** {auth.gateway_name}")
+            if auth.shadow_spoof:
+                st.error(f"🚨 Shadow spoofing: From={auth.from_domain} vs Return-Path={auth.rp_domain}")
+            if auth.hop_anomaly:
+                st.warning(auth.hop_anomaly)
             if auth.hop_delays:
                 stalls = [(i+1,d) for i,d in enumerate(auth.hop_delays) if d>300]
-                if stalls:
-                    for hop, delay in stalls:
-                        st.warning(f"Hop {hop}: {delay/60:.1f}min delay")
+                for hop, delay in stalls:
+                    st.warning(f"⚠️ Hop {hop}: {delay/60:.1f}min relay delay")
             abuse = R.get('abuse_data',{})
-            if abuse:
+            if abuse and abuse.get('abuseConfidenceScore') is not None:
                 ascore = abuse.get('abuseConfidenceScore',0)
-                c = DC['critical'] if ascore>=75 else (DC['high'] if ascore>=40 else DC['ok'])
-                st.markdown(f"<div style='border-left:4px solid {c};padding:12px;background:{c}22;border-radius:6px;margin:8px 0'>"
-                            f"<b>AbuseIPDB:</b> {ascore}/100 | Reports: {abuse.get('totalReports',0)} | "
-                            f"ISP: {_esc(abuse.get('isp','')[:40])} | Country: {abuse.get('countryCode','')}"
-                            f"{'<br>🧅 TOR Exit Node' if abuse.get('isTor') else ''}</div>", unsafe_allow_html=True)
-            if R['spoof']:
+                ac = DC['critical'] if ascore>=75 else (DC['high'] if ascore>=40 else DC['ok'])
+                st.markdown(
+                    f"<div style='border-left:4px solid {ac};padding:14px;background:{ac}22;"
+                    f"border-radius:8px;margin:12px 0'><b>🌐 Source IP (AbuseIPDB)</b><br>"
+                    f"Score: <b style='color:{ac}'>{ascore}/100</b> | "
+                    f"Reports: {abuse.get('totalReports',0)} | "
+                    f"Country: {abuse.get('countryCode','')} | "
+                    f"ISP: {_esc(abuse.get('isp','')[:40])}"
+                    f"{'<br>🧅 TOR Exit Node' if abuse.get('isTor') else ''}</div>",
+                    unsafe_allow_html=True)
+            if R.get('spoof'):
                 st.error(f"🎭 {R['spoof']}")
-            for d in auth.details: st.info(f"ℹ️ {d}")
-            for a in R['anomalies']:
-                if 'hijack' in a.lower(): st.error(f"🚨 {a}")
-                else: st.warning(f"⚠️ {a}")
+            st.markdown("#### 📋 Detailed Analysis")
+            for d in auth.details:
+                du = d.upper()
+                if any(k in du for k in ["FAIL","SPOOF","WARNING"]): st.error(f"⚠️ {d}")
+                elif any(k in du for k in ["PASS","VERIFIED","TRUSTED","CLEAN","GATEWAY"]): st.success(f"✅ {d}")
+                else: st.info(f"ℹ️ {d}")
+            if R['anomalies']:
+                st.markdown("#### 🔎 Header Anomalies")
+                for a in R['anomalies']:
+                    if 'hijack' in a.lower(): st.error(f"🚨 {a}")
+                    else: st.warning(f"⚠️ {a}")
 
-        # ── Tab 3: URLs ───────────────────────────────────────────────────
+        # ══════════════════════════════════════════════════════════════════
+        # TAB 3: URLs & Domains
+        # ══════════════════════════════════════════════════════════════════
         with tabs[2]:
-            st.subheader("🌐 URLs, Domains & IPs")
+            st.subheader("🌐 URL, Domain & IP Analysis")
             ltms = R.get('link_mismatches',[])
             real_ltm = [m for m in ltms if not m.is_tracking]
             track_ltm = [m for m in ltms if m.is_tracking]
             if real_ltm:
-                st.error(f"🚨 {len(real_ltm)} link-text mismatch(es)")
-                for m in real_ltm: st.markdown(f"- Shows `{_esc(m.display_domain)}` → links to `{_esc(m.href_domain)}`")
+                st.error(f"🚨 **{len(real_ltm)} link-text mismatch(es)** — displayed domain differs from actual link")
+                for m in real_ltm:
+                    st.markdown(f"- **Display:** `{_esc(m.display_domain)}` → **Links to:** `{_esc(m.href_domain)}`")
             if track_ltm:
-                st.info(f"ℹ️ {len(track_ltm)} link(s) via known tracking domains (suppressed)")
-            st.divider()
+                st.info(f"ℹ️ {len(track_ltm)} link(s) via known tracking/marketing domains (suppressed as expected)")
+            if real_ltm or track_ltm: st.divider()
+
             obs = R['observables']
             if obs:
-                for o in sorted(obs, key=lambda x: x.threat_score, reverse=True):
-                    if not o.vt: continue
-                    tl = o.vt.threat_level or "UNKNOWN"; ic = _ti(tl); c = _tc(tl)
+                vt_obs = [o for o in obs if o.vt]
+                threat_cnt = sum(1 for o in vt_obs if o.vt.threat_level in ('CRITICAL','MALICIOUS'))
+                clean_cnt = sum(1 for o in vt_obs if o.vt.threat_level in ('CLEAN','LOW'))
+                mc1,mc2,mc3 = st.columns(3)
+                mc1.metric("Total Scanned", len(vt_obs))
+                mc2.metric("✅ Clean", clean_cnt)
+                mc3.metric("🚨 Threats", threat_cnt)
+                st.divider()
+
+                _sort = {'CRITICAL':0,'MALICIOUS':1,'SUSPICIOUS':2,'HIGH':3,'UNKNOWN':4,'LOW':5,'CLEAN':6}
+                for o in sorted(vt_obs, key=lambda x: _sort.get(x.vt.threat_level or '',7)):
+                    tl = o.vt.threat_level or "UNKNOWN"; ic = _ti(tl)
                     tags = ""
                     if o.source=='html_href': tags+=" [HREF]"
                     if o.is_shortener: tags+=" [SHORT]"
                     if o.suspicious_tld: tags+=" [SUS-TLD]"
-                    if o.path_entropy>4.0: tags+=f" [ENT:{o.path_entropy:.1f}]"
-                    with st.expander(f"{ic} {o.type.upper()}{tags}: {o.defanged[:60]}", expanded=tl in ('CRITICAL','MALICIOUS')):
-                        st.markdown(f"`{o.defanged}`")
+                    if o.path_entropy>4.8: tags+=f" [HIGH-ENTROPY]"
+                    with st.expander(f"{ic} {o.type.upper()}{tags}: {o.defanged[:60]}",
+                                     expanded=tl in ('CRITICAL','MALICIOUS','SUSPICIOUS')):
+                        st.markdown(f"**Value:** `{o.defanged}`")
                         if o.vt.reasoning:
-                            if tl in ('CRITICAL','MALICIOUS'): st.error(o.vt.reasoning)
-                            elif tl=='SUSPICIOUS': st.warning(o.vt.reasoning)
-                            elif tl=='CLEAN': st.success(o.vt.reasoning)
-                            else: st.info(o.vt.reasoning)
+                            if tl in ('CRITICAL','MALICIOUS'): st.error(f"💡 {o.vt.reasoning}")
+                            elif tl=='SUSPICIOUS': st.warning(f"💡 {o.vt.reasoning}")
+                            elif tl=='CLEAN': st.success(f"✅ {o.vt.reasoning}")
+                            else: st.info(f"💡 {o.vt.reasoning}")
                         if o.vt.domain_intel and o.vt.domain_intel.typosquat:
                             st.error(f"🚨 {o.vt.domain_intel.typosquat}")
             else:
-                st.success("✅ No observables")
+                st.success("✅ No observables extracted")
 
-        # ── Tab 4: Attachments ────────────────────────────────────────────
+        # ══════════════════════════════════════════════════════════════════
+        # TAB 4: Attachments
+        # ══════════════════════════════════════════════════════════════════
         with tabs[3]:
-            st.subheader("📎 Attachments")
-            for risk in R['attachment_risks']:
-                if risk['severity']=='CRITICAL': st.error(f"🚨 {risk['desc']}")
-                elif risk['severity']=='HIGH': st.warning(f"⚠️ {risk['desc']}")
-                else: st.info(f"ℹ️ {risk['desc']}")
+            st.subheader("📎 Attachment Analysis")
+            for risk in R.get('attachment_risks',[]):
+                if risk['severity']=='CRITICAL': st.error(f"🚨 [{risk['severity']}] {risk['desc']}")
+                elif risk['severity']=='HIGH': st.warning(f"⚠️ [{risk['severity']}] {risk['desc']}")
+                else: st.info(f"ℹ️ [{risk['severity']}] {risk['desc']}")
+            if R.get('attachment_risks'): st.divider()
+
             for m in R['macros']:
-                c = DC['critical'] if m.risk_score>=70 else (DC['high'] if m.risk_score>=40 else DC['ok'])
-                st.markdown(f"<div style='border-left:4px solid {c};background:{c}22;padding:12px;margin:8px 0;border-radius:6px'>"
-                            f"<b>{_esc(m.filename)}</b> | {m.file_type} | Risk: {m.risk_score}/100 | {_esc(m.verdict)}"
-                            f"{'<br>☠️ MALWARE: '+_esc(m.mb_family) if m.mb_found else ''}</div>", unsafe_allow_html=True)
+                mc = DC['critical'] if m.risk_score>=70 else (DC['high'] if m.risk_score>=40 else DC['ok'])
+                mi = "🔴" if m.risk_score>=70 else ("🟡" if m.risk_score>=40 else "🟢")
+                st.markdown(
+                    f"<div style='border-left:4px solid {mc};background:{mc}22;padding:14px;"
+                    f"margin:10px 0;border-radius:8px'>"
+                    f"<h4 style='margin:0 0 6px 0'>{mi} {_esc(m.filename)}</h4>"
+                    f"<p style='margin:0;font-size:.9em'><b>Type:</b> {_esc(m.file_type)} | "
+                    f"<b>Risk:</b> {m.risk_score}/100 | <b>Verdict:</b> {_esc(m.verdict)}</p>"
+                    f"{'<p style=\"margin:4px 0;color:'+DC['text2']+';font-size:.8em\">SHA256: '+_esc(m.sha256)+'</p>' if m.sha256 else ''}"
+                    f"{'<p style=\"margin:4px 0;color:'+DC['critical']+';font-weight:700\">☠️ MALWARE: '+_esc(m.mb_family)+'</p>' if m.mb_found else ''}"
+                    f"</div>",
+                    unsafe_allow_html=True)
                 if m.pdf_uris:
                     with st.expander(f"🔗 {len(m.pdf_uris)} embedded URL(s)"):
                         for u in m.pdf_uris: st.code(defang(u))
                 if m.details:
-                    with st.expander("📋 Details"):
+                    with st.expander("📋 Analysis Details"):
                         for d in m.details: st.text(d)
 
-        # ── Tab 5: YARA ───────────────────────────────────────────────────
-        with tabs[4]:
-            st.subheader("🔴 YARA Results")
-            hits = [(m.filename,y) for m in R['macros'] for y in m.yara_matches]
-            if hits:
-                for fn, y in hits:
-                    c = _tc(y['severity'])
-                    st.markdown(f"<div style='border-left:4px solid {c};background:{c}15;padding:12px;margin:6px 0;border-radius:6px'>"
-                                f"<b style='color:{c}'>🔴 {_esc(y['rule'])}</b> [{y['severity']}]<br>{_esc(y['desc'])}<br>"
-                                f"<span style='font-size:.82em;color:{DC['text2']}'>File: {_esc(fn)}</span></div>", unsafe_allow_html=True)
-            elif YARA_OK: st.success("✅ No YARA matches")
-            else: st.warning("YARA offline")
+            if not R['macros']:
+                st.success("✅ No attachments to analyze")
 
-        # ── Tab 6: Images ─────────────────────────────────────────────────
+        # ══════════════════════════════════════════════════════════════════
+        # TAB 5: YARA
+        # ══════════════════════════════════════════════════════════════════
+        with tabs[4]:
+            st.subheader("🔴 YARA Engine Results")
+            hits = [(m.filename, y) for m in R['macros'] for y in m.yara_matches]
+            if hits:
+                st.markdown(f"**{len(hits)} rule(s) fired across {len(set(f for f,_ in hits))} source(s)**")
+                st.divider()
+                for fn, y in hits:
+                    yc = _tc(y['severity'])
+                    st.markdown(
+                        f"<div style='border-left:5px solid {yc};background:{yc}15;padding:16px;"
+                        f"margin:10px 0;border-radius:8px'>"
+                        f"<div style='display:flex;justify-content:space-between;margin-bottom:6px'>"
+                        f"<span style='color:{yc};font-weight:700;font-size:1.05em'>🔴 {_esc(y['rule'])}</span>"
+                        f"<span style='background:{yc};color:#fff;padding:2px 10px;border-radius:12px;"
+                        f"font-size:.82em;font-weight:700'>{_esc(y['severity'])}</span></div>"
+                        f"<div style='color:{DC['text1']}'>{_esc(y['desc'])}</div>"
+                        f"<div style='color:{DC['text2']};font-size:.85em;margin-top:4px'>"
+                        f"📄 {_esc(fn)}</div></div>",
+                        unsafe_allow_html=True)
+            elif YARA_OK:
+                st.success("✅ YARA engine scanned all files — 0 rule matches")
+            else:
+                st.warning("⚠️ YARA engine offline. Install: `pip install yara-python`")
+
+        # ══════════════════════════════════════════════════════════════════
+        # TAB 6: Images
+        # ══════════════════════════════════════════════════════════════════
         with tabs[5]:
             st.subheader("🖼️ Image Forensics")
-            for img in R['images']:
-                with st.expander(f"📷 {img.filename}", expanded=True):
-                    if img.data: st.image(img.data, use_container_width=True)
-                    st.text(f"Format: {img.fmt} | Size: {img.size}")
-                    for f in img.findings:
-                        if 'steg' in f.lower(): st.error(f"🚨 {f}")
-                        elif 'qr' in f.lower(): st.warning(f"⚠️ {f}")
-                        elif 'ocr' in f.lower(): st.info(f"🔍 {f}")
-                        else: st.info(f"ℹ️ {f}")
-                    if img.ocr_text:
-                        with st.expander("🔍 OCR Text"):
-                            st.text(img.ocr_text[:500])
-            if not R['images']: st.success("✅ No images")
+            if R['images']:
+                for img in R['images']:
+                    with st.expander(f"📷 {img.filename}", expanded=True):
+                        ic1, ic2 = st.columns([1,2])
+                        with ic1:
+                            if img.data: st.image(img.data, use_container_width=True)
+                        with ic2:
+                            st.text(f"Format: {img.fmt} | Size: {img.size}")
+                            for f in img.findings:
+                                if 'steg' in f.lower(): st.error(f"🚨 {f}")
+                                elif 'qr' in f.lower(): st.warning(f"⚠️ {f}")
+                                elif 'ocr' in f.lower(): st.info(f"🔍 {f}")
+                                else: st.info(f"ℹ️ {f}")
+                            if img.ocr_text:
+                                with st.expander("🔍 OCR Extracted Text"):
+                                    st.text(img.ocr_text[:500])
+            else:
+                st.success("✅ No images found in this email")
 
-        # ── Tab 7: All Findings ───────────────────────────────────────────
+        # ══════════════════════════════════════════════════════════════════
+        # TAB 7: All Findings
+        # ══════════════════════════════════════════════════════════════════
         with tabs[6]:
             st.subheader("📊 Complete Signal Table")
             if R['signals']:
                 df = pd.DataFrame([{
-                    'Tier':f"T{s.tier}",'Category':s.category,'Signal':s.title,
-                    'Probability':f"{s.probability:.0%}",'Confidence':f"{s.confidence:.0%}",
-                    'Effective':f"{s.probability*s.confidence:.0%}",
-                    'Detail':s.detail[:80]
+                    'Tier': f"T{s.tier}", 'Category': s.category, 'Signal': s.title,
+                    'Probability': f"{s.probability:.0%}", 'Confidence': f"{s.confidence:.0%}",
+                    'Impact': f"{s.probability*s.confidence:.0%}", 'Detail': s.detail[:80]
                 } for s in sorted(R['signals'], key=lambda x: x.probability*x.confidence, reverse=True)])
                 st.dataframe(df, use_container_width=True, hide_index=True)
-            else: st.success("✅ No findings")
+            else:
+                st.success("✅ No findings")
 
-        # ── Tab 8: Export ─────────────────────────────────────────────────
+            if R['trust_factors']:
+                st.subheader("🛡️ Trust Factor Table")
+                tdf = pd.DataFrame([{
+                    'Factor': tf.name, 'Strength': f"{tf.strength:.0%}",
+                    'Confidence': f"{tf.confidence:.0%}", 'Description': tf.description
+                } for tf in R['trust_factors']])
+                st.dataframe(tdf, use_container_width=True, hide_index=True)
+
+        # ══════════════════════════════════════════════════════════════════
+        # TAB 8: Export
+        # ══════════════════════════════════════════════════════════════════
         with tabs[7]:
-            c1,c2,c3 = st.columns(3)
-            c1.download_button("📥 TXT Report", txt, "sherlock_v10_report.txt", "text/plain")
-            if PDF_REPORT_OK:
-                pdf = generate_pdf_report(txt)
-                if pdf: c2.download_button("📥 PDF Report", pdf, "sherlock_v10_report.pdf", "application/pdf")
-            c3.download_button("📥 JSON", json.dumps(R, default=str, indent=2), "sherlock_v10_data.json", "application/json")
+            st.subheader("💾 Export Options")
+            ec1, ec2, ec3 = st.columns(3)
+            with ec1:
+                st.download_button("📥 Download TXT Report", txt,
+                                   "sherlock_report.txt", "text/plain")
+            with ec2:
+                if PDF_REPORT_OK:
+                    pdf = generate_pdf_report(txt)
+                    if pdf:
+                        st.download_button("📥 Download PDF Report", pdf,
+                                           "sherlock_report.pdf", "application/pdf")
+                else:
+                    st.warning("Install reportlab for PDF export")
+            with ec3:
+                st.download_button("📥 Download JSON Data",
+                                   json.dumps(R, default=str, indent=2),
+                                   "sherlock_data.json", "application/json")
 
     except Exception as e:
-        st.error(f"❌ Error: {e}")
+        st.error(f"❌ Analysis Error: {e}")
         import traceback
-        with st.expander("🐛 Debug"): st.code(traceback.format_exc())
+        with st.expander("🐛 Debug Traceback"):
+            st.code(traceback.format_exc())
+        log.error(f"Analysis failed: {traceback.format_exc()}")
 
 if __name__ == "__main__":
     main()
