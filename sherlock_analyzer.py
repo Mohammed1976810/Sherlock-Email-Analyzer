@@ -1350,6 +1350,19 @@ def analyze_attachment(data, filename) -> MacroResult:
 # OBSERVABLE EXTRACTION (BeautifulSoup + heuristics)
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def _normalize_url(url: str) -> str:
+    """Normalize URL for deduplication: strip trailing slash, lowercase host."""
+    try:
+        p = urlparse(url)
+        host = p.netloc.lower()
+        path = p.path.rstrip('/')
+        query = p.query
+        norm = f"{p.scheme}://{host}{path}"
+        if query: norm += f"?{query}"
+        return norm
+    except Exception:
+        return url.rstrip('/')
+
 def extract_observables(msg, html_body, text_body) -> Tuple[List[Observable], List[LinkMismatch]]:
     """Extract observables using DOM parsing. Detect link-text mismatches with tracking allowlist."""
     obs: List[Observable] = []
@@ -1357,7 +1370,9 @@ def extract_observables(msg, html_body, text_body) -> Tuple[List[Observable], Li
     seen: Set[str] = set()
 
     def _add(typ, val, src, **kw):
-        key = f"{typ}:{val}"
+        # Normalize URLs before deduplication
+        norm_val = _normalize_url(val) if typ == 'url' else val.lower()
+        key = f"{typ}:{norm_val}"
         if key in seen: return
         seen.add(key)
         o = Observable(type=typ, value=val, defanged=defang(val), source=src, **kw)
@@ -1866,12 +1881,19 @@ def analyze_email(msg_bytes, status_fn, progress_fn):
             if not data: continue
             macro = analyze_attachment(data, fname)
             macros.append(macro)
-            # Scan embedded URIs
+            # Scan embedded URIs — tag source by file type
+            uri_source = 'pdf_uri' if macro.file_type == 'PDF' else 'office_link'
             for u in macro.pdf_uris:
                 if u.startswith('http'):
-                    uo = Observable(type='url',value=u,defanged=defang(u),source='embedded')
+                    uo = Observable(type='url',value=u,defanged=defang(u),source=uri_source)
                     uo.vt = check_vt('url', u)
-                    if uo.vt and uo.vt.threat_level in ('CRITICAL','MALICIOUS'): uo.threat_score=100
+                    if uo.vt and uo.vt.success:
+                        if uo.vt.threat_level in ('CRITICAL','MALICIOUS'):
+                            uo.threat_score=100; uo.reputation='malicious'
+                        elif uo.vt.threat_level == 'SUSPICIOUS':
+                            uo.threat_score=50; uo.reputation='suspicious'
+                        else:
+                            uo.reputation='clean'
                     observables.append(uo)
         except Exception as e: log.error(f"Attachment {fname}: {e}")
 
@@ -2439,30 +2461,58 @@ def main():
                 vt_obs = [o for o in obs if o.vt]
                 threat_cnt = sum(1 for o in vt_obs if o.vt.threat_level in ('CRITICAL','MALICIOUS'))
                 clean_cnt = sum(1 for o in vt_obs if o.vt.threat_level in ('CLEAN','LOW'))
-                mc1,mc2,mc3 = st.columns(3)
+                pdf_cnt = sum(1 for o in vt_obs if o.source == 'pdf_uri')
+                office_cnt = sum(1 for o in vt_obs if o.source == 'office_link')
+                unk_cnt = sum(1 for o in vt_obs if o.vt.threat_level == 'UNKNOWN')
+
+                mc1,mc2,mc3,mc4 = st.columns(4)
                 mc1.metric("Total Scanned", len(vt_obs))
                 mc2.metric("✅ Clean", clean_cnt)
                 mc3.metric("🚨 Threats", threat_cnt)
+                mc4.metric("📄 From Files", pdf_cnt + office_cnt)
+
+                if unk_cnt:
+                    st.info(f"ℹ️ **{unk_cnt} URL(s) show UNKNOWN** — not in VirusTotal database. UNKNOWN ≠ malicious; investigate if unexpected.")
+                if pdf_cnt:
+                    st.markdown(f"<div style='background:{DC['accent']}15;border-left:3px solid {DC['accent']};padding:8px 12px;border-radius:4px;margin:4px 0;color:{DC['text1']};font-size:.9em'>🔗 <b>{pdf_cnt} URL(s) extracted from PDF</b> attachment structure and scanned</div>", unsafe_allow_html=True)
+                if office_cnt:
+                    st.markdown(f"<div style='background:{DC['purple']}15;border-left:3px solid {DC['purple']};padding:8px 12px;border-radius:4px;margin:4px 0;color:{DC['text1']};font-size:.9em'>🔗 <b>{office_cnt} URL(s) extracted from Office</b> document relationships and scanned</div>", unsafe_allow_html=True)
                 st.divider()
 
+                # Source badge styling
+                _src_badge = {
+                    'pdf_uri':('📄 PDF','#0ea5e9','#fff'), 'office_link':('📝 Office','#8b5cf6','#fff'),
+                    'html_href':('🔗 HREF','#475569','#e2e8f0'), 'body':('📧 Body','#475569','#e2e8f0'),
+                    'image_qr':('📱 QR','#f59e0b','#000'), 'received':('📡 Header','#475569','#e2e8f0'),
+                    'header':('📡 Header','#475569','#e2e8f0'),
+                }
                 _sort = {'CRITICAL':0,'MALICIOUS':1,'SUSPICIOUS':2,'HIGH':3,'UNKNOWN':4,'LOW':5,'CLEAN':6}
                 for o in sorted(vt_obs, key=lambda x: _sort.get(x.vt.threat_level or '',7)):
-                    tl = o.vt.threat_level or "UNKNOWN"; ic = _ti(tl)
-                    tags = ""
-                    if o.source=='html_href': tags+=" [HREF]"
-                    if o.is_shortener: tags+=" [SHORT]"
-                    if o.suspicious_tld: tags+=" [SUS-TLD]"
-                    if o.path_entropy>4.8: tags+=f" [HIGH-ENTROPY]"
-                    with st.expander(f"{ic} {o.type.upper()}{tags}: {o.defanged[:60]}",
-                                     expanded=tl in ('CRITICAL','MALICIOUS','SUSPICIOUS')):
-                        st.markdown(f"**Value:** `{o.defanged}`")
+                    tl = o.vt.threat_level or "UNKNOWN"; ic = _ti(tl); clr = _tc(tl)
+                    sl, sb, sf = _src_badge.get(o.source, ('','#475569','#e2e8f0'))
+                    flags = ""
+                    if o.is_shortener: flags += " [SHORT]"
+                    if o.suspicious_tld: flags += " [SUS-TLD]"
+                    if o.path_entropy > 4.8: flags += " [HIGH-ENTROPY]"
+                    with st.expander(f"{ic} {o.type.upper()}{flags}: {o.defanged[:55]}", expanded=tl in ('CRITICAL','MALICIOUS','SUSPICIOUS')):
+                        badge = f"<span style='background:{sb};color:{sf};padding:2px 8px;border-radius:4px;font-size:.78em;font-weight:600;margin-right:8px'>{sl}</span>" if sl else ""
+                        vt_lbl = f"<span style='background:{clr};color:#fff;padding:2px 8px;border-radius:4px;font-size:.78em;font-weight:600'>{_esc(tl)}</span>"
+                        st.markdown(f"{badge}{vt_lbl} <code style='color:{DC['accent']};margin-left:8px'>{_esc(o.defanged)}</code>", unsafe_allow_html=True)
                         if o.vt.reasoning:
                             if tl in ('CRITICAL','MALICIOUS'): st.error(f"💡 {o.vt.reasoning}")
-                            elif tl=='SUSPICIOUS': st.warning(f"💡 {o.vt.reasoning}")
-                            elif tl=='CLEAN': st.success(f"✅ {o.vt.reasoning}")
+                            elif tl == 'SUSPICIOUS': st.warning(f"💡 {o.vt.reasoning}")
+                            elif tl == 'CLEAN': st.success(f"✅ {o.vt.reasoning}")
+                            elif tl == 'UNKNOWN': st.info(f"❓ {o.vt.reasoning} — not in VT database, not confirmed safe")
                             else: st.info(f"💡 {o.vt.reasoning}")
-                        if o.vt.domain_intel and o.vt.domain_intel.typosquat:
-                            st.error(f"🚨 {o.vt.domain_intel.typosquat}")
+                        if o.vt.domain_intel:
+                            di = o.vt.domain_intel
+                            if di.typosquat: st.error(f"🚨 {di.typosquat}")
+                            parts = []
+                            if di.category and di.category != 'unknown': parts.append(f"**{di.category}**")
+                            if di.age_days > 0: parts.append(f"{'🆕' if di.age_days<30 else '📅'} {di.age_days}d old")
+                            if di.org: parts.append(f"Org: {di.org}")
+                            if di.trusted: parts.append("🛡️ Trusted")
+                            if parts: st.caption(" | ".join(parts))
             else:
                 st.success("✅ No observables extracted")
 
@@ -2534,20 +2584,43 @@ def main():
             st.subheader("🖼️ Image Forensics")
             if R['images']:
                 for img in R['images']:
-                    with st.expander(f"📷 {img.filename}", expanded=True):
-                        ic1, ic2 = st.columns([1,2])
-                        with ic1:
-                            if img.data: st.image(img.data, use_container_width=True)
-                        with ic2:
-                            st.text(f"Format: {img.fmt} | Size: {img.size}")
-                            for f in img.findings:
-                                if 'steg' in f.lower(): st.error(f"🚨 {f}")
-                                elif 'qr' in f.lower(): st.warning(f"⚠️ {f}")
-                                elif 'ocr' in f.lower(): st.info(f"🔍 {f}")
-                                else: st.info(f"ℹ️ {f}")
-                            if img.ocr_text:
-                                with st.expander("🔍 OCR Extracted Text"):
-                                    st.text(img.ocr_text[:500])
+                    has_threat = any('steg' in f.lower() or 'overlay' in f.lower() or 'pattern' in f.lower() for f in img.findings)
+                    ic = DC['critical'] if has_threat else (DC['warn'] if img.qr_links else DC['ok'])
+                    status = "⚠️ Suspicious" if has_threat else ("📱 QR Detected" if img.qr_links else "✅ Clean")
+                    st.markdown(
+                        f"<div style='border-left:4px solid {ic};background:{ic}15;padding:14px;margin:8px 0;border-radius:8px'>"
+                        f"<div style='display:flex;justify-content:space-between;align-items:center'>"
+                        f"<b style='color:{DC['text1']}'>📷 {_esc(img.filename)}</b>"
+                        f"<span style='background:{ic};color:#fff;padding:2px 10px;border-radius:10px;font-size:.8em;font-weight:600'>{status}</span>"
+                        f"</div>"
+                        f"<div style='color:{DC['text2']};font-size:.85em;margin-top:4px'>Format: {_esc(img.fmt)} | Size: {img.size[0]}x{img.size[1]}</div>"
+                        f"</div>", unsafe_allow_html=True)
+                    ic1, ic2 = st.columns([1, 2])
+                    with ic1:
+                        if img.data:
+                            try: st.image(img.data, use_container_width=True)
+                            except: st.caption("(Preview unavailable)")
+                    with ic2:
+                        for f in img.findings:
+                            fl = f.lower()
+                            if 'steg' in fl or 'overlay' in fl or 'pattern' in fl:
+                                st.error(f"🚨 {f}")
+                            elif 'qr' in fl:
+                                st.warning(f"⚠️ {f}")
+                            elif 'ocr' in fl:
+                                st.info(f"🔍 {f}")
+                            elif 'clean' in fl or '✅' in f:
+                                st.success(f)
+                            else:
+                                st.info(f"ℹ️ {f}")
+                        if img.ocr_text:
+                            with st.expander("🔍 OCR Extracted Text"):
+                                st.text(img.ocr_text[:500])
+                        if img.qr_links:
+                            st.markdown("**📱 QR Code Links:**")
+                            for ql in img.qr_links:
+                                st.code(defang(ql))
+                    st.markdown("---")
             else:
                 st.success("✅ No images found in this email")
 
