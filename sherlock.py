@@ -233,14 +233,45 @@ KNOWN_PLATFORMS = {
     'sparkpostmail.com': 'SparkPost', 'postmarkapp.com': 'Postmark',
 }
 
+# Marketing / tracking domains AND security gateway URL rewriters.
+# These domains wrap or redirect links legitimately. Without this allowlist,
+# every email processed by Proofpoint, Trend Micro, Mimecast, etc. triggers
+# false-positive link-text mismatches (display shows original domain, href
+# is rewritten to the gateway's domain).
 TRACKING_ALLOWLIST = {
+    # Marketing / email platforms
     'sendgrid.net', 'mailchimp.com', 'mailgun.org', 'mandrillapp.com',
     'sparkpostmail.com', 'postmarkapp.com', 'list-manage.com',
     'click.mailchimp.com', 'links.m.example.com',
     'us-east-2.amazonses.com', 'email.mg.example.com',
-    'click.pstmrk.it', 'ct.sendgrid.net', 'url.emailprotection.link',
-    'safelinks.protection.outlook.com', 'urldefense.proofpoint.com',
-    'urldefense.com',
+    'click.pstmrk.it', 'ct.sendgrid.net',
+    # Security gateway URL rewriters (these wrap URLs for click-time scanning)
+    'safelinks.protection.outlook.com',   # Microsoft Safe Links
+    'urldefense.proofpoint.com',          # Proofpoint URL Defense
+    'urldefense.com',                     # Proofpoint URL Defense (short)
+    'url.emailprotection.link',           # Generic email protection
+    'trendmicro.com',                     # Trend Micro (root)
+    'smex-ctp.trendmicro.com',           # Trend Micro Click Time Protection
+    'imrworldwide.com',                   # Trend Micro / Nielsen
+    'cloudmark.com',                      # Cloudmark
+    'fireeye.com',                        # FireEye/Trellix URL rewriting
+    'mimecastprotect.com',               # Mimecast
+    'protect-eu.mimecast.com',           # Mimecast EU
+    'protect-us.mimecast.com',           # Mimecast US
+    'protect-au.mimecast.com',           # Mimecast AU
+    'protect-za.mimecast.com',           # Mimecast ZA
+    'barracuda.com',                     # Barracuda link protection
+    'linkprotect.cudasvc.com',           # Barracuda CUDA
+    'secureweb.cisco.com',               # Cisco Email Security
+    'ironport.com',                      # Cisco IronPort
+    'sophos.com',                        # Sophos email protection
+    'reflexion.net',                     # Sophos Reflexion
+    'messagelabs.com',                   # Broadcom/Symantec
+    'brightcloud.com',                   # Webroot BrightCloud
+    'appriver.com',                      # AppRiver
+    'zixcorp.com',                       # Zix encryption
+    'websense.com',                      # Forcepoint/Websense
+    'forcepoint.com',                    # Forcepoint
 }
 
 MARKETING_RP_DOMAINS = {
@@ -684,12 +715,20 @@ def _safe_strip_www(domain: str) -> str:
 
 
 def is_tracking_domain(domain: str) -> bool:
-    """Check if domain is a known email tracking/redirect service."""
+    """Check if domain is a known email tracking/redirect/security gateway service.
+    Matches exact domain, root domain, AND parent domain (so sub.trendmicro.com
+    matches trendmicro.com in the allowlist)."""
     d = _safe_strip_www(domain.lower())
     if d in TRACKING_ALLOWLIST:
         return True
     root = _root_domain(d)
-    return root in TRACKING_ALLOWLIST
+    if root in TRACKING_ALLOWLIST:
+        return True
+    # Check if any allowlisted domain is a suffix (parent domain match)
+    for allowed in TRACKING_ALLOWLIST:
+        if d.endswith('.' + allowed):
+            return True
+    return False
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -984,6 +1023,11 @@ def domain_intel(domain: str) -> DomainIntel:
         if dl == td or dl.endswith('.' + td):
             di.category = 'major_tech'; di.trusted = True
             di.reasoning = f'Major tech ({td})'; return di
+
+    # Check if domain is a known security gateway / email protection service
+    if is_tracking_domain(dl):
+        di.category = 'security_gateway'; di.trusted = True
+        di.reasoning = f'Email security gateway'; return di
 
     if WHOIS_OK:
         try:
@@ -2041,14 +2085,22 @@ def generate_signals(auth, anomalies, reply_hijack, bec, spoof_result, spoof_dn,
         trust.append(TrustFactor('bec_contradiction', 0.10, 0.60,
             "BEC contradiction: urgency + calm language"))
 
-    # -- Link-text mismatches --
+    # -- Link-text mismatches (deduplicated by domain pair) --
     real_mismatches = [m for m in link_mismatches if not m.is_tracking]
     tracking_mismatches = [m for m in link_mismatches if m.is_tracking]
-    if real_mismatches:
+    # Deduplicate: same display→href pair only counts once for scoring
+    seen_mm = set()
+    unique_mm = []
+    for m in real_mismatches:
+        pair = (m.display_domain, m.href_domain)
+        if pair not in seen_mm:
+            seen_mm.add(pair)
+            unique_mm.append(m)
+    if unique_mm:
         sigs.append(ThreatSignal('link_text_mismatch', 'content', 2, 0.55, 0.85,
-            f"{len(real_mismatches)} Link-Text Mismatch(es)",
+            f"{len(unique_mm)} Link-Text Mismatch(es)",
             "Displayed domain differs from link destination",
-            f"e.g. shows '{real_mismatches[0].display_domain}' -> '{real_mismatches[0].href_domain}'"))
+            f"e.g. shows '{unique_mm[0].display_domain}' -> '{unique_mm[0].href_domain}'"))
     if tracking_mismatches:
         trust.append(TrustFactor('tracking_links', 0.05, 0.70,
             f"{len(tracking_mismatches)} link(s) via known tracking domains"))
@@ -2167,6 +2219,9 @@ def get_attachment_risks(msg) -> List[Dict]:
     risks = []
     for part in msg.walk():
         if part.get_content_maintype() == 'multipart':
+            continue
+        # Skip image parts — handled in Image Forensics
+        if part.get_content_type().startswith('image/'):
             continue
         fname = part.get_filename() or ''
         if not fname:
@@ -2427,6 +2482,9 @@ def analyze_email(msg_bytes, status_fn, progress_fn):
     for part in msg.walk():
         if part.get_content_maintype() == 'multipart':
             continue
+        # Skip image/* parts — they are handled in the Images + OCR section
+        if part.get_content_type().startswith('image/'):
+            continue
         fname = part.get_filename()
         if not fname:
             continue
@@ -2660,10 +2718,18 @@ def build_reasoning_cards(R):
 
     ltms = R.get('link_mismatches', [])
     real_ltm = [m for m in ltms if not m.is_tracking]
-    if real_ltm:
+    # Deduplicate for card display
+    seen_pairs = set()
+    unique_ltm = []
+    for m in real_ltm:
+        pair = (m.display_domain, m.href_domain)
+        if pair not in seen_pairs:
+            seen_pairs.add(pair)
+            unique_ltm.append(m)
+    if unique_ltm:
         cards.append(('\U0001f517', 'Link-Text Mismatches',
-            f"\U0001f6a8 **{len(real_ltm)} mismatch(es)** -- displayed domain differs from actual link.",
-            f"e.g. Shows '{real_ltm[0].display_domain}' -> links to '{real_ltm[0].href_domain}'",
+            f"\U0001f6a8 **{len(unique_ltm)} unique mismatch(es)** -- displayed domain differs from actual link.",
+            f"e.g. Shows '{unique_ltm[0].display_domain}' -> links to '{unique_ltm[0].href_domain}'",
             DC['critical']))
 
     real_att = [m for m in R['macros'] if m.filename != '[Body]']
@@ -3024,11 +3090,39 @@ def main():
             real_ltm = [m for m in ltms if not m.is_tracking]
             track_ltm = [m for m in ltms if m.is_tracking]
             if real_ltm:
-                st.error(f"\U0001f6a8 **{len(real_ltm)} link-text mismatch(es)**")
+                # Deduplicate by (display_domain, href_domain) pair
+                seen_pairs = set()
+                unique_ltm = []
                 for m in real_ltm:
-                    st.markdown(f"- **Display:** `{_esc(m.display_domain)}` -> **Links to:** `{_esc(m.href_domain)}`")
+                    pair = (m.display_domain, m.href_domain)
+                    if pair not in seen_pairs:
+                        seen_pairs.add(pair)
+                        unique_ltm.append(m)
+                st.error(f"\U0001f6a8 **{len(unique_ltm)} unique link-text mismatch(es)** "
+                         f"({len(real_ltm)} total occurrences)")
+                for m in unique_ltm:
+                    st.markdown(
+                        f"- **Display:** `{_esc(m.display_domain)}` "
+                        f"\u2192 **Links to:** `{_esc(m.href_domain)}`")
             if track_ltm:
-                st.info(f"\u2139\ufe0f {len(track_ltm)} link(s) via known tracking/marketing domains (suppressed)")
+                # Deduplicate tracking mismatches too
+                seen_gw = set()
+                unique_gw = []
+                for m in track_ltm:
+                    if m.href_domain not in seen_gw:
+                        seen_gw.add(m.href_domain)
+                        unique_gw.append(m)
+                with st.expander(
+                    f"\U0001f6e1\ufe0f {len(track_ltm)} link(s) via security gateways "
+                    f"(normal -- suppressed from scoring)"):
+                    st.markdown(
+                        "These links were rewritten by email security gateways "
+                        "(Proofpoint, Trend Micro, Mimecast, etc.) for click-time "
+                        "URL scanning. This is **expected behavior** and not a phishing indicator.")
+                    for m in unique_gw:
+                        st.caption(
+                            f"\U0001f6e1\ufe0f `{_esc(m.display_domain)}` \u2192 "
+                            f"`{_esc(m.href_domain)}` (security rewrite)")
             if real_ltm or track_ltm:
                 st.divider()
 
@@ -3037,35 +3131,127 @@ def main():
                 vt_obs = [o for o in obs if o.vt]
                 threat_cnt = sum(1 for o in vt_obs if o.vt.threat_level in ('CRITICAL', 'MALICIOUS'))
                 clean_cnt = sum(1 for o in vt_obs if o.vt.threat_level in ('CLEAN', 'LOW'))
-                mc1, mc2, mc3 = st.columns(3)
+                unk_cnt = sum(1 for o in vt_obs if o.vt.threat_level == 'UNKNOWN')
+                mc1, mc2, mc3, mc4 = st.columns(4)
                 mc1.metric("Total Scanned", len(vt_obs))
                 mc2.metric("\u2705 Clean", clean_cnt)
                 mc3.metric("\U0001f6a8 Threats", threat_cnt)
+                mc4.metric("\u2753 Unknown", unk_cnt)
+                if unk_cnt:
+                    st.markdown(
+                        f"<div style='background:{DC['accent']}12;border-left:3px solid {DC['accent']};"
+                        f"padding:10px 14px;border-radius:6px;margin:4px 0;color:{DC['text1']};"
+                        f"font-size:.88em'>\u2139\ufe0f <b>{unk_cnt} URL(s) show UNKNOWN</b> -- "
+                        f"not in VirusTotal database. UNKNOWN \u2260 malicious. "
+                        f"Security gateway rewrites (Proofpoint, Trend Micro, etc.) "
+                        f"are normal and labeled accordingly.</div>",
+                        unsafe_allow_html=True)
                 st.divider()
 
                 _sort = {'CRITICAL': 0, 'MALICIOUS': 1, 'SUSPICIOUS': 2, 'HIGH': 3,
                          'UNKNOWN': 4, 'LOW': 5, 'CLEAN': 6}
                 for o in sorted(vt_obs, key=lambda x: _sort.get(x.vt.threat_level or '', 7)):
                     tl = o.vt.threat_level or "UNKNOWN"
-                    ic = _ti(tl)
+
+                    # Enrich UNKNOWN URLs with local intelligence context
+                    di = o.vt.domain_intel if o.vt else None
+                    is_gateway = False
+                    try:
+                        url_dom = _safe_strip_www(urlparse(o.value).netloc.lower()) if o.type == 'url' else o.value.lower()
+                        is_gateway = is_tracking_domain(url_dom)
+                    except Exception:
+                        pass
+
+                    # Determine display-level: upgrade UNKNOWN to contextual labels
+                    if tl == 'UNKNOWN' and is_gateway:
+                        display_level = "GATEWAY"
+                        ic = "\U0001f6e1\ufe0f"
+                        display_color = DC['accent']
+                    elif tl == 'UNKNOWN' and di and di.trusted:
+                        display_level = "TRUSTED"
+                        ic = "\u2705"
+                        display_color = DC['ok']
+                    elif tl == 'UNKNOWN' and di and di.typosquat:
+                        display_level = "SUSPICIOUS"
+                        ic = "\u26a0\ufe0f"
+                        display_color = DC['warn']
+                    elif tl == 'UNKNOWN':
+                        display_level = "UNKNOWN"
+                        ic = "\u2753"
+                        display_color = DC['unknown']
+                    else:
+                        display_level = tl
+                        ic = _ti(tl)
+                        display_color = _tc(tl)
+
                     flags = ""
                     if o.is_shortener:
                         flags += " [SHORT]"
                     if o.suspicious_tld:
                         flags += " [SUS-TLD]"
+                    if is_gateway:
+                        flags += " [SECURITY-GW]"
+
                     with st.expander(f"{ic} {o.type.upper()}{flags}: {o.defanged[:55]}",
                                      expanded=tl in ('CRITICAL', 'MALICIOUS', 'SUSPICIOUS')):
-                        if o.vt.reasoning:
-                            if tl in ('CRITICAL', 'MALICIOUS'):
-                                st.error(f"\U0001f4a1 {o.vt.reasoning}")
-                            elif tl == 'SUSPICIOUS':
-                                st.warning(f"\U0001f4a1 {o.vt.reasoning}")
-                            elif tl == 'CLEAN':
-                                st.success(f"\u2705 {o.vt.reasoning}")
-                            else:
+                        # Verdict badge + defanged URL
+                        st.markdown(
+                            f"<span style='background:{display_color};color:#fff;padding:3px 10px;"
+                            f"border-radius:6px;font-size:.8em;font-weight:700'>"
+                            f"{_esc(display_level)}</span>"
+                            f" <code style='color:{DC['accent']};margin-left:8px'>"
+                            f"{_esc(o.defanged)}</code>",
+                            unsafe_allow_html=True)
+
+                        # Context-aware reasoning display
+                        if tl in ('CRITICAL', 'MALICIOUS'):
+                            st.error(f"\U0001f4a1 {o.vt.reasoning}")
+                        elif tl == 'SUSPICIOUS':
+                            st.warning(f"\U0001f4a1 {o.vt.reasoning}")
+                        elif tl == 'CLEAN':
+                            st.success(f"\u2705 {o.vt.reasoning}")
+                        elif is_gateway:
+                            st.success(
+                                f"\U0001f6e1\ufe0f **Security gateway URL** -- this link was "
+                                f"rewritten by an email security service for click-time "
+                                f"scanning. This is normal and expected behavior.")
+                        elif di and di.trusted:
+                            st.success(
+                                f"\u2705 **Trusted domain** -- {di.reasoning}. "
+                                f"Not in VirusTotal database, but domain is locally verified "
+                                f"as legitimate ({di.category}).")
+                        elif tl == 'UNKNOWN':
+                            # Rich UNKNOWN display with local intel
+                            reason = o.vt.reasoning or "Not in VT"
+                            intel_parts = []
+                            if di:
+                                if di.category and di.category != 'unknown':
+                                    intel_parts.append(f"Category: **{di.category}**")
+                                if di.age_days > 0:
+                                    age_icon = "\U0001f195" if di.age_days < 30 else "\U0001f4c5"
+                                    intel_parts.append(f"{age_icon} Domain age: {di.age_days}d")
+                                if di.org:
+                                    intel_parts.append(f"Org: {di.org}")
+                                if di.typosquat:
+                                    st.error(f"\U0001f6a8 {di.typosquat}")
+                                if di.reasoning:
+                                    intel_parts.append(di.reasoning)
+
+                            st.info(
+                                f"\u2139\ufe0f **{reason}** -- URL not found in VirusTotal "
+                                f"database. This does NOT mean it is malicious. "
+                                f"VT only indexes previously-scanned URLs.")
+                            if intel_parts:
+                                st.caption(
+                                    f"\U0001f50d **Local Intelligence:** "
+                                    f"{' | '.join(intel_parts)}")
+                        else:
+                            if o.vt.reasoning:
                                 st.info(f"\U0001f4a1 {o.vt.reasoning}")
-                        if o.vt.domain_intel and o.vt.domain_intel.typosquat:
-                            st.error(f"\U0001f6a8 {o.vt.domain_intel.typosquat}")
+
+                        # Domain intel (for all levels, if available and not already shown)
+                        if di and di.typosquat and tl != 'UNKNOWN':
+                            st.error(f"\U0001f6a8 {di.typosquat}")
             else:
                 st.success("\u2705 No observables extracted")
 
@@ -3078,7 +3264,9 @@ def main():
                     st.warning(f"\u26a0\ufe0f [{risk['severity']}] {risk['desc']}")
                 else:
                     st.info(f"\u2139\ufe0f [{risk['severity']}] {risk['desc']}")
-            for m in R['macros']:
+            # Filter out [Body] pseudo-entry and display real file attachments
+            real_macros = [m for m in R['macros'] if m.filename != '[Body]']
+            for m in real_macros:
                 mc_color = DC['critical'] if m.risk_score >= 70 else (DC['high'] if m.risk_score >= 40 else DC['ok'])
                 mi = "\U0001f534" if m.risk_score >= 70 else ("\U0001f7e1" if m.risk_score >= 40 else "\U0001f7e2")
                 st.markdown(
@@ -3086,14 +3274,21 @@ def main():
                     f"margin:10px 0;border-radius:8px'>"
                     f"<h4 style='margin:0 0 6px 0'>{mi} {_esc(m.filename)}</h4>"
                     f"<p style='margin:0;font-size:.9em'><b>Type:</b> {_esc(m.file_type)} | "
-                    f"<b>Risk:</b> {m.risk_score}/100 | <b>Verdict:</b> {_esc(m.verdict)}</p></div>",
+                    f"<b>Risk:</b> {m.risk_score}/100 | <b>Verdict:</b> {_esc(m.verdict)}</p>"
+                    f"{'<p style=\"margin:4px 0;color:'+DC['text2']+';font-size:.8em\">SHA256: '+_esc(m.sha256)+'</p>' if m.sha256 else ''}"
+                    f"{'<p style=\"margin:4px 0;color:'+DC['critical']+';font-weight:700\">MALWARE: '+_esc(m.mb_family)+'</p>' if m.mb_found else ''}"
+                    f"</div>",
                     unsafe_allow_html=True)
+                if m.pdf_uris:
+                    with st.expander(f"\U0001f517 {len(m.pdf_uris)} embedded URL(s)"):
+                        for u in m.pdf_uris:
+                            st.code(defang(u))
                 if m.details:
                     with st.expander("\U0001f4cb Analysis Details"):
                         for d in m.details:
                             st.text(d)
-            if not R['macros']:
-                st.success("\u2705 No attachments to analyze")
+            if not real_macros and not R.get('attachment_risks'):
+                st.success("\u2705 No file attachments to analyze")
 
         with tabs[4]:
             st.subheader("\U0001f534 YARA Engine Results")
@@ -3120,28 +3315,83 @@ def main():
             st.subheader("\U0001f5bc\ufe0f Image Forensics")
             if R['images']:
                 for img in R['images']:
-                    ic_color = DC['warn'] if img.qr_links else DC['ok']
-                    if img.has_steg:
+                    # Determine verdict for this image
+                    has_threat = img.has_steg or any(
+                        'steg' in f.lower() or 'overlay' in f.lower()
+                        for f in img.findings)
+                    has_qr = bool(img.qr_links)
+                    is_tracker = any('tracking' in f.lower() or '<=2x2' in f
+                                     for f in img.findings)
+
+                    if has_threat:
                         ic_color = DC['critical']
+                        verdict_text = "\U0001f6a8 SUSPICIOUS"
+                        verdict_detail = "Steganography or hidden content detected"
+                    elif has_qr:
+                        ic_color = DC['warn']
+                        verdict_text = "\u26a0\ufe0f QR CODE FOUND"
+                        verdict_detail = "Contains QR code with embedded URL(s)"
+                    elif is_tracker:
+                        ic_color = DC['text2']
+                        verdict_text = "\U0001f4e1 TRACKING PIXEL"
+                        verdict_detail = "Tiny image used for email open tracking"
+                    else:
+                        ic_color = DC['ok']
+                        verdict_text = "\u2705 CLEAN"
+                        verdict_detail = "No threats, hidden data, or QR codes found"
+
+                    # Image header with verdict badge
                     st.markdown(
-                        f"<div style='border-left:4px solid {ic_color};background:{ic_color}15;"
-                        f"padding:14px;margin:8px 0;border-radius:8px'>"
-                        f"<b>\U0001f4f7 {_esc(img.filename)}</b> | "
-                        f"Format: {_esc(img.fmt)} | Size: {img.size[0]}x{img.size[1]}</div>",
+                        f"<div style='border-left:4px solid {ic_color};background:{ic_color}12;"
+                        f"padding:14px 16px;margin:10px 0;border-radius:8px'>"
+                        f"<div style='display:flex;justify-content:space-between;align-items:center;"
+                        f"flex-wrap:wrap;gap:8px'>"
+                        f"<b style='color:{DC['text1']};font-size:1.05em'>"
+                        f"\U0001f4f7 {_esc(img.filename)}</b>"
+                        f"<span style='background:{ic_color};color:#fff;padding:4px 14px;"
+                        f"border-radius:12px;font-size:.82em;font-weight:700'>"
+                        f"{verdict_text}</span></div>"
+                        f"<div style='color:{DC['text2']};font-size:.85em;margin-top:6px'>"
+                        f"Format: {_esc(img.fmt or 'Unknown')} | "
+                        f"Size: {img.size[0]}x{img.size[1]} | "
+                        f"{verdict_detail}</div></div>",
                         unsafe_allow_html=True)
-                    for f in img.findings:
-                        fl = f.lower()
-                        if 'steg' in fl:
-                            st.error(f"\U0001f6a8 {f}")
-                        elif 'qr' in fl:
-                            st.warning(f"\u26a0\ufe0f {f}")
-                        elif 'ocr' in fl:
-                            st.info(f"\U0001f50d {f}")
+
+                    # Image preview + findings side by side
+                    col_img, col_info = st.columns([1, 2])
+                    with col_img:
+                        if img.data:
+                            try:
+                                st.image(img.data, caption=img.filename,
+                                         use_container_width=True)
+                            except Exception:
+                                st.caption("(Preview not available)")
                         else:
-                            st.info(f"\u2139\ufe0f {f}")
-                    if img.ocr_text:
-                        with st.expander("\U0001f50d OCR Extracted Text"):
-                            st.text(img.ocr_text[:500])
+                            st.caption("(No image data)")
+                    with col_info:
+                        if img.findings:
+                            for f in img.findings:
+                                fl = f.lower()
+                                if 'steg' in fl or 'overlay' in fl:
+                                    st.error(f"\U0001f6a8 {f}")
+                                elif 'qr' in fl:
+                                    st.warning(f"\u26a0\ufe0f {f}")
+                                elif 'ocr' in fl:
+                                    st.info(f"\U0001f50d {f}")
+                                elif 'tracking' in fl or '<=2x2' in fl:
+                                    st.caption(f"\U0001f4e1 {f}")
+                                else:
+                                    st.info(f"\u2139\ufe0f {f}")
+                        else:
+                            st.success("\u2705 No anomalies detected in this image")
+                        if img.ocr_text:
+                            with st.expander("\U0001f50d OCR Extracted Text"):
+                                st.text(img.ocr_text[:500])
+                        if img.qr_links:
+                            st.markdown("**\U0001f4f1 QR Code Links:**")
+                            for ql in img.qr_links:
+                                st.code(defang(ql))
+                    st.divider()
             else:
                 st.success("\u2705 No images found in this email")
 
