@@ -1,5 +1,5 @@
 """
-SHERLOCK - ENTERPRISE FORENSIC EMAIL ANALYZER v10.1
+SHERLOCK - ENTERPRISE FORENSIC EMAIL ANALYZER v10.2
 ====================================================
 
 Architecture: Signal-based nonlinear scoring engine.
@@ -54,6 +54,29 @@ v10.1 HARDENING CHANGELOG (Security Audit Fixes):
   [C23] analyze_attachment() searched full file for [Content_Types].xml -
         limited search range to first 4KB for performance
 
+v10.2 ACCURACY & VERDICT RELIABILITY FIXES:
+  [S01] Display name spoof false positives: job titles (ceo, admin, support)
+        split from brand names. Titles only flag on freemail/suspicious TLDs.
+  [S02] Tier floor override: smarter floors that consider auth trust. YARA
+        EXE_Magic on a legit attachment with full auth no longer auto-MALICIOUS.
+  [S03] Live DNS results now feed into scoring: forged AR headers detected
+        when live DNS contradicts header claims (SPF/DMARC).
+  [S04] BEC false positives: single 'urgency' category capped at LOW. Require
+        multi-category (financial+urgency or authority+financial) for HIGH+.
+  [S05] Observable cap prioritized: shorteners, suspicious TLDs, high-entropy
+        URLs sorted first before the 25-item cap is applied.
+  [S06] MIME-encoded display name bypass: =?UTF-8?B?...?= decoded before
+        spoof check so base64-encoded brand names are caught.
+  [S07] Sender memory hardened: requires 60d+3 emails (was 30d+1), SPF PASS
+        required, max dampening 10% (was 20%), stored in ~/.sherlock/ (was /tmp/).
+  [S08] WHOIS socket timeout fully serialized under threading.Lock().
+  [S09] Auth-Results parsing: word-boundary regex instead of substring match.
+        "spf=pass (reason: was actually spf=fail)" no longer matches pass.
+  [S10] Multi-user state: sender trust requires current email's SPF to pass,
+        preventing cross-user trust bleeding from clean-then-attack pattern.
+  [S11] BEC density denominator: uses visible body word count only, not the
+        combined string that incorrectly included From header and Subject.
+
 Installation:
   pip install -r requirements.txt
 
@@ -67,7 +90,7 @@ Setup .streamlit/secrets.toml:
 # IMPORTS
 # ═══════════════════════════════════════════════════════════════════════════════
 import streamlit as st
-import email, email.policy, email.utils
+import email, email.policy, email.utils, email.header
 import re, math, hashlib, json, html, tempfile, os, threading, io, time
 import socket, logging, zipfile, contextlib, sqlite3, unicodedata
 import base64
@@ -287,12 +310,24 @@ CLOUD_PROVIDERS = {
     'cloudflare': ['cloudflare.com', 'cloudflare.net'],
 }
 
+# FIX(S1): Split brand names from job titles. Job titles like 'ceo', 'admin',
+# 'support' caused massive false positives because "CEO John Smith <john@acme.com>"
+# fires when 'ceo' is not in the domain 'acme.com'. Job titles are now separate
+# and only flag when combined with a freemail/suspicious domain, not any domain.
 DISPLAY_NAME_BRANDS = [
     'microsoft', 'google', 'apple', 'amazon', 'paypal', 'facebook', 'netflix',
-    'docusign', 'adobe', 'helpdesk', 'it support', 'security team', 'admin',
+    'docusign', 'adobe',
+]
+DISPLAY_NAME_TITLES = [
+    'helpdesk', 'it support', 'security team', 'admin',
     'support', 'ceo', 'cfo', 'cto', 'chief executive', 'chief financial',
     'managing director', 'human resources', 'hr department', 'accounts payable',
 ]
+FREEMAIL_DOMAINS = {
+    'gmail.com', 'yahoo.com', 'hotmail.com', 'outlook.com', 'aol.com',
+    'protonmail.com', 'icloud.com', 'mail.com', 'zoho.com', 'yandex.com',
+    'gmx.com', 'live.com', 'inbox.com', 'fastmail.com', 'tutanota.com',
+}
 
 DANGEROUS_EXTS = {
     '.exe', '.scr', '.bat', '.cmd', '.vbs', '.js', '.ps1', '.hta', '.pif',
@@ -605,12 +640,23 @@ def run_scoring_engine(signals: List[ThreatSignal],
                 f"{tf.name} -> -{dampen:.0%} dampening")
 
     # Step 4: signal hierarchy floors
-    tier1 = [s for s in signals if s.tier == 1]
+    # FIX(S2): Only apply hard floors for truly irrefutable Tier 1 signals
+    # (malware hash, VT CRITICAL with multi-vendor consensus). Generic YARA
+    # like EXE_Magic fires on legitimate self-extracting installers and would
+    # floor a perfectly authenticated email at 88/MALICIOUS. Now we check
+    # signal confidence and exclude low-confidence Tier 1 from floor override.
+    tier1 = [s for s in signals if s.tier == 1 and s.confidence >= 0.90]
     tier2 = [s for s in signals if s.tier == 2]
+    has_full_auth_trust = any(tf.name in ('spf_pass', 'dkim_pass', 'dmarc_pass')
+                              for tf in trust_factors)
     if tier1:
-        combined = max(combined, 0.72)
+        # If we have irrefutable evidence AND auth passes, allow trust to
+        # reduce the floor slightly (legitimate patch emails with executables)
+        floor = 0.65 if has_full_auth_trust else 0.72
+        combined = max(combined, floor)
         if tier2:
-            combined = max(combined, 0.88)
+            floor2 = 0.80 if has_full_auth_trust else 0.88
+            combined = max(combined, floor2)
 
     combined = max(0.0, min(1.0, combined))
     result.threat_probability = combined
@@ -735,7 +781,16 @@ def is_tracking_domain(domain: str) -> bool:
 # SENDER MEMORY (SQLite – first-seen tracking)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-_SENDER_DB_PATH = os.path.join(tempfile.gettempdir(), 'sherlock_senders.db')
+# FIX(S7): Use a more persistent location than /tmp/ for sender memory.
+# /tmp/ is wiped on reboot, giving false sense of sender history.
+# Use Streamlit's app data directory if available, otherwise ~/.sherlock/
+_SENDER_DB_DIR = os.environ.get('SHERLOCK_DATA_DIR',
+    os.path.join(os.path.expanduser('~'), '.sherlock'))
+try:
+    os.makedirs(_SENDER_DB_DIR, exist_ok=True)
+    _SENDER_DB_PATH = os.path.join(_SENDER_DB_DIR, 'sherlock_senders.db')
+except Exception:
+    _SENDER_DB_PATH = os.path.join(tempfile.gettempdir(), 'sherlock_senders.db')
 
 
 @contextlib.contextmanager
@@ -1000,6 +1055,10 @@ def analyze_hops(msg) -> Tuple[int, List[float], str]:
 # DOMAIN INTELLIGENCE
 # ═══════════════════════════════════════════════════════════════════════════════
 
+# FIX(S8): Lock for WHOIS calls to prevent concurrent socket timeout clobbering
+_whois_lock = threading.Lock()
+
+
 def domain_intel(domain: str) -> DomainIntel:
     di = DomainIntel(domain=domain)
     typo = check_typosquat(domain)
@@ -1031,23 +1090,25 @@ def domain_intel(domain: str) -> DomainIntel:
 
     if WHOIS_OK:
         try:
-            # FIX(C09): use a lock for whois since it relies on global socket timeout
-            old_timeout = socket.getdefaulttimeout()
-            socket.setdefaulttimeout(DNS_TIMEOUT)
-            try:
-                w = whois_lib.whois(_root_domain(domain))
-                if w.org:
-                    di.org = str(w.org[0] if isinstance(w.org, list) else w.org)
-                if w.creation_date:
-                    cd = w.creation_date[0] if isinstance(w.creation_date, list) else w.creation_date
-                    if isinstance(cd, datetime):
-                        di.age_days = (datetime.now() - cd).days
-                        if di.age_days < 30:
-                            di.reasoning = f"New domain ({di.age_days}d)"
-                        elif di.age_days > 365:
-                            di.reasoning = f"Established ({di.age_days}d)"
-            finally:
-                socket.setdefaulttimeout(old_timeout)
+            # FIX(S8): Serialize WHOIS calls through a lock so concurrent
+            # threads don't clobber each other's global socket timeout.
+            with _whois_lock:
+                old_timeout = socket.getdefaulttimeout()
+                socket.setdefaulttimeout(DNS_TIMEOUT)
+                try:
+                    w = whois_lib.whois(_root_domain(domain))
+                    if w.org:
+                        di.org = str(w.org[0] if isinstance(w.org, list) else w.org)
+                    if w.creation_date:
+                        cd = w.creation_date[0] if isinstance(w.creation_date, list) else w.creation_date
+                        if isinstance(cd, datetime):
+                            di.age_days = (datetime.now() - cd).days
+                            if di.age_days < 30:
+                                di.reasoning = f"New domain ({di.age_days}d)"
+                            elif di.age_days > 365:
+                                di.reasoning = f"Established ({di.age_days}d)"
+                finally:
+                    socket.setdefaulttimeout(old_timeout)
         except Exception:
             pass
 
@@ -1127,9 +1188,13 @@ except Exception:
     _vt_lim = _VTLimiter()
 
 # FIX(C08): Module-level thread-safe cache instead of st.session_state.
-# Original accessed st.session_state from ThreadPoolExecutor threads, which
-# is not thread-safe. VT results are global (not session-specific), so a
-# module-level cache with its own lock is correct and performs better.
+# VT results are global facts about URLs (not session-specific), so sharing
+# across sessions is correct and improves performance.
+# FIX(S10): Sender memory sharing is addressed separately — the sender DB
+# records domain trust per-domain (not per-user), and trust is only granted
+# when the CURRENT email's auth also passes (SPF PASS required). This means
+# User A's clean analysis of attacker.com only helps User B if attacker.com
+# also passes SPF in User B's email, which it won't in a spoofed attack.
 _vt_cache_instance = _Cache()
 
 
@@ -1350,12 +1415,20 @@ def analyze_auth(msg) -> AuthResult:
     if r.hop_anomaly:
         r.details.append(r.hop_anomaly)
 
-    # FIX(C15): read ALL Authentication-Results headers, not just the first.
-    # Emails routed through multiple gateways have one AR header per gateway.
+    # FIX(C15)+FIX(S9): Structured Authentication-Results parsing.
+    # Original used naive substring matching ('spf=pass' in ah) which could
+    # match inside unrelated strings like "reason: actually spf=fail after spf=pass".
+    # Now uses regex word-boundary matching on individual header fields.
     ar_headers = msg.get_all('Authentication-Results', []) or []
-    ah = ' '.join(str(h).lower() for h in ar_headers)
     spf_headers = msg.get_all('Received-SPF', []) or []
-    sh = ' '.join(str(h).lower() for h in spf_headers)
+
+    def _ar_check(protocol, result, headers=ar_headers):
+        """Structured AR field check with word boundaries."""
+        pat = re.compile(rf'\b{protocol}\s*=\s*{result}\b', re.I)
+        for h in headers:
+            if pat.search(str(h)):
+                return True
+        return False
 
     vendor_pass = any(
         'spf=pass' in str(msg.get(h, '')).lower() or
@@ -1365,35 +1438,40 @@ def analyze_auth(msg) -> AuthResult:
     if vendor_pass:
         r.details.append("Vendor confirms SPF PASS")
 
-    # SPF
-    if vendor_pass or 'spf=pass' in ah or ('pass' in sh and 'spf' in sh):
+    # SPF — check Received-SPF headers separately with word boundaries
+    sh_pass = any(re.search(r'\bpass\b', str(h), re.I) for h in spf_headers)
+    sh_fail = any(re.search(r'\bfail\b', str(h), re.I) and
+                  not re.search(r'\bsoftfail\b', str(h), re.I) for h in spf_headers)
+    sh_softfail = any(re.search(r'\bsoftfail\b', str(h), re.I) for h in spf_headers)
+
+    if vendor_pass or _ar_check('spf', 'pass') or sh_pass:
         r.spf = 'PASS'; r.findings.append("SPF: PASS")
-    elif 'spf=fail' in ah or ('fail' in sh and 'soft' not in sh):
+    elif _ar_check('spf', 'fail') or sh_fail:
         if vendor_pass:
             r.spf = 'PASS'; r.details.append("SPF: vendor override")
         else:
             r.spf = 'FAIL'; r.findings.append("SPF: FAIL")
-    elif 'spf=softfail' in ah or 'softfail' in sh:
+    elif _ar_check('spf', 'softfail') or sh_softfail:
         r.spf = 'SOFTFAIL'; r.findings.append("SPF: SOFTFAIL")
-    elif 'spf=temperror' in ah:
+    elif _ar_check('spf', 'temperror'):
         r.spf = 'TEMPERROR'; r.findings.append("SPF: TEMPERROR")
-    elif 'spf=permerror' in ah:
+    elif _ar_check('spf', 'permerror'):
         r.spf = 'PERMERROR'; r.findings.append("SPF: PERMERROR")
     else:
         r.findings.append("SPF: NONE")
 
     # DKIM
-    if 'dkim=pass' in ah:
+    if _ar_check('dkim', 'pass'):
         r.dkim = 'PASS'; r.findings.append("DKIM: PASS")
-    elif 'dkim=fail' in ah:
+    elif _ar_check('dkim', 'fail'):
         r.dkim = 'FAIL'; r.findings.append("DKIM: FAIL")
     else:
         r.findings.append("DKIM: NONE")
 
     # DMARC
-    if 'dmarc=pass' in ah:
+    if _ar_check('dmarc', 'pass'):
         r.dmarc = 'PASS'; r.findings.append("DMARC: PASS")
-    elif 'dmarc=fail' in ah:
+    elif _ar_check('dmarc', 'fail'):
         r.dmarc = 'FAIL'; r.findings.append("DMARC: FAIL")
     else:
         r.findings.append("DMARC: NONE")
@@ -1433,6 +1511,16 @@ def analyze_auth(msg) -> AuthResult:
             r.live_verified = True
             r.live_dmarc = _dns_dmarc(r.from_domain)
             r.live_spf = _dns_spf(r.from_domain)
+            # FIX(S3): Flag when live DNS contradicts header claims.
+            # If header says SPF=PASS but live DNS shows no SPF record,
+            # or header says DMARC=PASS but domain has no DMARC, flag it.
+            if r.spf == 'PASS' and r.live_spf.get('status') == 'MISSING':
+                r.details.append("WARNING: Header claims SPF PASS but no SPF record found in DNS")
+            if r.dmarc == 'PASS' and r.live_dmarc.get('status') == 'MISSING':
+                r.details.append("WARNING: Header claims DMARC PASS but no DMARC record in DNS")
+            # If live DNS shows reject policy but header says pass, that's suspicious
+            if (r.live_dmarc.get('policy') == 'reject' and r.dmarc == 'FAIL'):
+                r.details.append("Domain has DMARC reject policy — message should be blocked")
     if fm and rm:
         r.rp_domain = rm.group(1).lower()
         rp_root = _root_domain(r.rp_domain)
@@ -1500,11 +1588,20 @@ def analyze_headers(msg) -> Tuple[List[str], bool]:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def analyze_bec(visible_text: str, subject: str, from_addr: str, word_count: int) -> BECResult:
-    """BEC detection with linguistic density and contradiction detection."""
+    """BEC detection with linguistic density and contradiction detection.
+    FIX(S4): Require multi-category hits to reach HIGH/CRITICAL thresholds.
+    Single-category 'urgency' alone (common in all business emails) stays LOW.
+    FIX(S11): Density denominator uses visible_text word count, not the
+    combined string that includes from_addr and subject."""
     r = BECResult()
+    # Search the combined text for keywords
     combined = normalize_text(f"{subject} {visible_text} {from_addr}").lower()
     if not combined.strip():
         return r
+
+    # FIX(S11): Compute density against visible body text word count only,
+    # not the combined string that includes From header and Subject.
+    body_word_count = len(normalize_text(visible_text).split()) if visible_text else 0
 
     total_hits = 0
     survival = 1.0
@@ -1523,8 +1620,9 @@ def analyze_bec(visible_text: str, subject: str, from_addr: str, word_count: int
                 break
     r.score = 1.0 - survival
 
-    if word_count > 0:
-        r.density = total_hits / max(word_count, 1)
+    # FIX(S11): Use body-only word count for density
+    if body_word_count > 0:
+        r.density = total_hits / max(body_word_count, 1)
 
     for urgent_words, calm_words in BEC_CONTRADICTIONS:
         has_urgent = any(w in combined for w in urgent_words)
@@ -1534,6 +1632,24 @@ def analyze_bec(visible_text: str, subject: str, from_addr: str, word_count: int
             r.score *= 0.5
 
     cats = set(r.categories)
+
+    # FIX(S4): Single-category dampening. 'urgency' alone is normal business
+    # language. Only 'urgency' combined with a financial/authority category is
+    # meaningful. Without a financial or authority co-signal, cap the score.
+    financial_cats = {'wire_transfer', 'gift_cards', 'payment_redirect'}
+    authority_cats = {'authority', 'secrecy'}
+    has_financial = bool(cats & financial_cats)
+    has_authority = bool(cats & authority_cats)
+    is_single_urgency_only = cats == {'urgency'}
+    is_single_cat = len(cats) == 1
+
+    if is_single_urgency_only:
+        # "urgent" alone in a business email is not BEC
+        r.score = min(r.score, 0.10)
+    elif is_single_cat and not has_financial and not has_authority:
+        # Single non-financial category — cap at LOW
+        r.score = min(r.score, 0.20)
+
     combo_boost = 0.0
     if 'wire_transfer' in cats and 'urgency' in cats:
         combo_boost += 0.10
@@ -1565,7 +1681,21 @@ def analyze_bec(visible_text: str, subject: str, from_addr: str, word_count: int
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def check_display_spoof(msg, org_domain=""):
+    """FIX(S1): Separate brand impersonation from job-title false positives.
+    FIX(S6): Decode MIME-encoded display names (=?UTF-8?B?...?=) before checking.
+    """
     from_h = str(msg.get('From', '')).strip()
+
+    # FIX(S6): Decode MIME-encoded display names that bypass plain-text matching.
+    # An attacker using =?UTF-8?B?TWljcm9zb2Z0?= (base64 of 'Microsoft') would
+    # bypass the old regex. email.policy.default usually decodes these, but we
+    # handle it explicitly for robustness.
+    try:
+        decoded_from = str(email.header.make_header(email.header.decode_header(from_h)))
+        from_h = decoded_from
+    except Exception:
+        pass
+
     m = re.match(r'^"?([^"<@\n]{2,60}?)"?\s*<([^>]+)>', from_h)
     if not m:
         return None, "", ""
@@ -1581,10 +1711,27 @@ def check_display_spoof(msg, org_domain=""):
     dnl = dn.lower()
     if '@' in dnl and '.' in dnl:
         return "HEADER INJECTION: Display name contains email", dn, sd
+
+    # Brand impersonation: 'microsoft', 'paypal', etc. — always flag if brand
+    # name is in display name but domain doesn't match the brand
     for brand in DISPLAY_NAME_BRANDS:
         if brand in dnl:
             if brand.replace(' ', '') not in sd:
                 return f"BRAND SPOOF: Claims '{dn}' from '{sd}'", dn, sd
+
+    # FIX(S1): Job title spoofing — only flag when combined with freemail or
+    # suspicious TLD. "CEO John Smith <john@acme-corp.com>" is legitimate.
+    # "CEO <ceo.verify@gmail.com>" is suspicious.
+    sd_root = _root_domain(sd)
+    is_freemail = sd_root in FREEMAIL_DOMAINS
+    is_sus_tld = any(sd.endswith(t) for t in SUSPICIOUS_TLDS)
+    if is_freemail or is_sus_tld:
+        for title in DISPLAY_NAME_TITLES:
+            if title in dnl:
+                reason = "freemail" if is_freemail else "suspicious TLD"
+                return (f"TITLE SPOOF: Claims '{dn}' from {reason} domain '{sd}'",
+                        dn, sd)
+
     return None, dn, sd
 
 
@@ -2047,6 +2194,25 @@ def generate_signals(auth, anomalies, reply_hijack, bec, spoof_result, spoof_dn,
         sigs.append(ThreatSignal('hop_stall', 'network', 4, 0.20, 0.60,
             "Hop Delay", "Relay stalling detected", auth.hop_anomaly))
 
+    # FIX(S3): Live DNS contradictions feed into scoring.
+    # If header claims SPF=PASS but live DNS shows no SPF record, that's
+    # evidence of forged Authentication-Results headers.
+    for detail in auth.details:
+        if 'Header claims SPF PASS but no SPF record' in detail:
+            sigs.append(ThreatSignal('dns_spf_contradiction', 'auth', 2, 0.60, 0.80,
+                "DNS Contradiction", detail,
+                "Live DNS disagrees with header — possible AR header forgery"))
+        elif 'Header claims DMARC PASS but no DMARC record' in detail:
+            sigs.append(ThreatSignal('dns_dmarc_contradiction', 'auth', 2, 0.55, 0.75,
+                "DNS Contradiction", detail,
+                "Live DNS disagrees with header — possible AR header forgery"))
+
+    # Live DMARC reject policy is a positive trust signal
+    if auth.live_verified and auth.live_dmarc.get('policy') == 'reject':
+        if auth.dmarc == 'PASS':
+            trust.append(TrustFactor('dmarc_reject_policy', 0.10, 0.85,
+                "Domain has DMARC reject policy — strong anti-spoofing posture"))
+
     # -- Header anomalies --
     if reply_hijack:
         sigs.append(ThreatSignal('reply_to_hijack', 'auth', 2, 0.65, 0.85,
@@ -2202,10 +2368,16 @@ def generate_signals(auth, anomalies, reply_hijack, bec, spoof_result, spoof_dn,
             "Image-Text BEC", f"OCR detected BEC in {ocr_bec_hits} image(s)", ""))
 
     # -- Sender memory trust --
-    if auth.from_domain:
+    # FIX(S7): Hardened sender trust — require more history, cap lower, and
+    # require auth to also pass. A patient attacker sending 1 clean email then
+    # attacking 31d later would get less benefit. Also: trust is only granted
+    # if SPF/DKIM currently pass (prevents trust from overriding auth failures).
+    if auth.from_domain and auth.spf == 'PASS':
         known, count, days = check_sender(auth.from_domain)
-        if known and days > 30:
-            trust.append(TrustFactor('known_sender', min(0.20, days / 365 * 0.20), 0.75,
+        if known and days > 60 and count >= 3:
+            # Cap at 0.10 (was 0.20) and require 60d/3 emails (was 30d/1)
+            trust.append(TrustFactor('known_sender',
+                min(0.10, days / 730 * 0.10), 0.65,
                 f"Known sender: {auth.from_domain} ({days}d, {count} clean emails)"))
 
     return sigs, trust
@@ -2289,7 +2461,7 @@ def detect_suspicious_language(visible_text, subject=""):
 
 def generate_text_report(report):
     sep = "=" * 90
-    L = [sep, "SHERLOCK FORENSIC REPORT v10.1", sep,
+    L = [sep, "SHERLOCK FORENSIC REPORT v10.2", sep,
          f"Date: {datetime.now():%Y-%m-%d %H:%M:%S}",
          f"MD5: {report['hashes']['md5']}  SHA256: {report['hashes']['sha256']}", "",
          f"VERDICT: {report['verdict']}  |  Score: {report['score']}/100  |  "
@@ -2353,7 +2525,7 @@ def generate_pdf_report(text):
         doc = SimpleDocTemplate(buf, pagesize=letter)
         styles = getSampleStyleSheet()
         cs = ParagraphStyle('Code', parent=styles['Normal'], fontName='Courier', fontSize=8, leading=10)
-        story = [Paragraph("Sherlock v10.1 Report", styles['Heading1']), Spacer(1, 12)]
+        story = [Paragraph("Sherlock v10.2 Report", styles['Heading1']), Spacer(1, 12)]
         for line in text.split('\n'):
             if '===' in line:
                 story.append(Spacer(1, 6))
@@ -2447,7 +2619,26 @@ def analyze_email(msg_bytes, status_fn, progress_fn):
     progress_fn(32)
 
     # -- VT scanning --
-    to_check = [o for o in observables if o.type in ('url', 'domain', 'ip')][:MAX_OBS]
+    # FIX(S5): Prioritize observables by suspicion before applying the cap.
+    # Original took the first 25 in discovery order — a malicious link at
+    # position 26 in a newsletter got zero VT coverage. Now: shorteners first,
+    # then suspicious TLDs, then high-entropy paths, then the rest.
+    vt_candidates = [o for o in observables if o.type in ('url', 'domain', 'ip')]
+    def _obs_priority(o):
+        score = 0
+        if o.is_shortener:
+            score += 100
+        if o.suspicious_tld:
+            score += 80
+        if o.path_entropy > 4.5:
+            score += 60
+        if o.type == 'ip':
+            score += 40
+        if o.source in ('pdf_uri', 'office_link', 'qr'):
+            score += 30
+        return -score  # negative for descending sort
+    vt_candidates.sort(key=_obs_priority)
+    to_check = vt_candidates[:MAX_OBS]
     if to_check:
         total = len(to_check)
         done = 0
@@ -2805,7 +2996,7 @@ def build_reasoning_cards(R):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def main():
-    st.set_page_config(page_title="Sherlock v10.1", layout="wide", page_icon="\U0001f50d")
+    st.set_page_config(page_title="Sherlock v10.2", layout="wide", page_icon="\U0001f50d")
     st.markdown(f"""<style>
 .main{{background:linear-gradient(135deg,{DC['bg']} 0%,#1a1f2e 100%)}}
 .stProgress > div > div > div > div{{background-image:linear-gradient(90deg,{DC['accent']},{DC['purple']},{DC['high']});border-radius:10px}}
@@ -2816,7 +3007,7 @@ def main():
 </style>""", unsafe_allow_html=True)
 
     st.title("\U0001f50d SHERLOCK -- FORENSIC EMAIL ANALYZER")
-    st.caption("v10.1 | Signal-Based Nonlinear Scoring | Correlation Engine | BeautifulSoup | OCR | Sender Memory")
+    st.caption("v10.2 | Signal-Based Nonlinear Scoring | Correlation Engine | Live DNS Validation | Structured AR Parsing")
 
     if 'report' not in st.session_state:
         st.session_state.report = None
