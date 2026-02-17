@@ -468,12 +468,13 @@ def run_scoring_engine(signals: List[ThreatSignal],
             result.correlations_applied.append(
                 f"{n1}+{n2} → +{boost:.2f}")
 
-    # Step 3: trust dampening
+    # Step 3: trust dampening (only log non-trivial dampening)
     for tf in trust_factors:
         dampen = tf.strength * tf.confidence
-        combined *= (1.0 - dampen)
-        result.dampening_applied.append(
-            f"{tf.name} → -{dampen:.2f}")
+        if dampen > 0.005:  # skip negligible dampening
+            combined *= (1.0 - dampen)
+            result.dampening_applied.append(
+                f"{tf.name} → -{dampen:.0%} dampening")
 
     # Step 4: signal hierarchy floors
     tiers = {s.tier for s in signals}
@@ -591,28 +592,38 @@ def _sender_db():
     conn.commit()
     return conn
 
-def record_sender(domain: str) -> Tuple[bool, int, int]:
-    """Record sender domain. Returns (is_known, times_seen, days_known)."""
+def check_sender(domain: str) -> Tuple[bool, int, int]:
+    """Check if sender is known WITHOUT recording. Returns (is_known, times_seen, days_known)."""
     if not domain: return False, 0, 0
     domain = domain.lower()
     try:
         conn = _sender_db()
         row = conn.execute("SELECT first_seen, count FROM senders WHERE domain=?", (domain,)).fetchone()
-        now = datetime.now().isoformat()
         if row:
             first_seen = datetime.fromisoformat(row[0])
-            count = row[1] + 1
-            conn.execute("UPDATE senders SET count=? WHERE domain=?", (count, domain))
-            conn.commit()
             days = (datetime.now() - first_seen).days
-            return True, count, days
+            return True, row[1], days
+        return False, 0, 0
+    except Exception as e:
+        log.debug(f"Sender memory check error: {e}")
+        return False, 0, 0
+
+def record_sender_if_clean(domain: str, is_clean: bool):
+    """Record sender ONLY if the email verdict is clean.
+    Prevents attackers from building trust via repeated malicious emails."""
+    if not domain or not is_clean: return
+    domain = domain.lower()
+    try:
+        conn = _sender_db()
+        row = conn.execute("SELECT count FROM senders WHERE domain=?", (domain,)).fetchone()
+        now = datetime.now().isoformat()
+        if row:
+            conn.execute("UPDATE senders SET count=count+1 WHERE domain=?", (domain,))
         else:
             conn.execute("INSERT INTO senders (domain, first_seen, count) VALUES (?,?,1)", (domain, now))
-            conn.commit()
-            return False, 1, 0
+        conn.commit()
     except Exception as e:
-        log.debug(f"Sender memory error: {e}")
-        return False, 0, 0
+        log.debug(f"Sender memory record error: {e}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1070,44 +1081,47 @@ def analyze_bec(visible_text: str, subject: str, from_addr: str, word_count: int
     combined = normalize_text(f"{subject} {visible_text} {from_addr}").lower()
     if not combined.strip(): return r
 
+    # Probability combination (not additive — diminishing returns built in)
     total_hits = 0
+    survival = 1.0  # probability of NOT being BEC
     for cat, (keywords, prob) in BEC_KEYWORDS.items():
         for kw in keywords:
+            matched = False
             try:
-                if re.search(kw, combined):
-                    r.categories.append(cat)
-                    r.findings.append(f"[{cat}] '{kw}'")
-                    total_hits += 1
-                    r.score += prob
-                    break
-            except:
-                if kw in combined:
-                    r.categories.append(cat)
-                    r.findings.append(f"[{cat}] '{kw}'")
-                    total_hits += 1
-                    r.score += prob
-                    break
+                matched = bool(re.search(kw, combined))
+            except Exception:
+                matched = kw in combined
+            if matched:
+                r.categories.append(cat)
+                r.findings.append(f"[{cat}] '{kw}'")
+                total_hits += 1
+                survival *= (1.0 - prob)
+                break
+    r.score = 1.0 - survival
 
     # Linguistic density: BEC hit count / total words
     if word_count > 0:
         r.density = total_hits / max(word_count, 1)
 
-    # Contradiction detection
+    # Contradiction detection — dampens score
     for urgent_words, calm_words in BEC_CONTRADICTIONS:
         has_urgent = any(w in combined for w in urgent_words)
         has_calm = any(w in combined for w in calm_words)
         if has_urgent and has_calm:
             r.contradictions.append("Claims urgency but also says 'no rush' — inconsistent")
-            r.score *= 0.5  # Halve score on contradiction
+            r.score *= 0.5
 
-    # Correlation combos
+    # Correlation combos — small boosts applied to remaining safe-probability
     cats = set(r.categories)
-    if 'wire_transfer' in cats and 'urgency' in cats: r.score += 0.15
-    if 'payment_redirect' in cats and 'urgency' in cats: r.score += 0.12
-    if 'authority' in cats and ('wire_transfer' in cats or 'gift_cards' in cats): r.score += 0.15
-    if 'secrecy' in cats and 'wire_transfer' in cats: r.score += 0.10
+    combo_boost = 0.0
+    if 'wire_transfer' in cats and 'urgency' in cats: combo_boost += 0.10
+    if 'payment_redirect' in cats and 'urgency' in cats: combo_boost += 0.08
+    if 'authority' in cats and ('wire_transfer' in cats or 'gift_cards' in cats): combo_boost += 0.10
+    if 'secrecy' in cats and 'wire_transfer' in cats: combo_boost += 0.07
+    if combo_boost > 0:
+        r.score = r.score + combo_boost * (1.0 - r.score)  # boost into remaining space
 
-    r.score = min(r.score, 1.0)
+    r.score = min(r.score, 0.95)  # never 100% certain from keywords alone
     if r.score >= 0.70: r.risk = "CRITICAL"; r.summary = f"HIGH-CONFIDENCE BEC (p={r.score:.0%})"
     elif r.score >= 0.45: r.risk = "HIGH"; r.summary = f"LIKELY BEC (p={r.score:.0%})"
     elif r.score >= 0.25: r.risk = "MEDIUM"; r.summary = f"BEC indicators (p={r.score:.0%})"
@@ -1219,12 +1233,27 @@ def analyze_attachment(data, filename) -> MacroResult:
         r.mb_found=True; r.mb_family=family; r.risk_score=100
         r.details.append(f"MALWARE BAZAAR: {family}")
 
-    # YARA
+    # YARA — smart Archive_Sig handling (chameleon attack detection)
     yara_hits = _yara_scan(data, filename)
     is_valid_office = data[:4]==b'PK\x03\x04' and b'[Content_Types].xml' in data
-    is_zip_file = filename.lower().endswith(('.zip','.rar','.7z','.gz','.tar'))
+    fl = filename.lower()
+    is_archive_ext = fl.endswith(('.zip','.rar','.7z','.gz','.tar','.tgz','.bz2'))
     for m in yara_hits:
-        if m['rule']=='Archive_Sig' and (is_valid_office or is_zip_file): continue
+        if m['rule'] == 'Archive_Sig':
+            if is_valid_office:
+                continue  # Expected: .docx/.xlsx/.pptx are ZIP-based
+            elif is_archive_ext:
+                continue  # Expected: file claims to be an archive and is one
+            else:
+                # CHAMELEON ATTACK: file has archive magic bytes but claims
+                # to be something else (e.g., invoice.pdf that's actually a ZIP)
+                m['severity'] = 'HIGH'
+                m['desc'] = (f"DISGUISED ARCHIVE: '{filename}' contains archive "
+                             f"structure but claims to be a non-archive file")
+                r.yara_matches.append(m)
+                r.risk_score = max(r.risk_score, 50)
+                r.details.append(f"CONTENT MISMATCH: '{filename}' is structurally an archive")
+                continue
         r.yara_matches.append(m)
     if r.yara_matches:
         sev_score = {'CRITICAL':80,'HIGH':50,'MEDIUM':25}
@@ -1240,11 +1269,22 @@ def analyze_attachment(data, filename) -> MacroResult:
         r.verdict = "SUSPICIOUS" if (r.yara_matches or r.has_macros) else "SAFE"
         return r
 
-    # Office
-    if data.startswith((b'\xD0\xCF\x11\xE0', b'PK\x03\x04')):
+    # Office (OLE or valid OOXML only — NOT plain ZIP files)
+    is_ole = data.startswith(b'\xD0\xCF\x11\xE0')
+    if is_ole or is_valid_office:
         r.file_type = "Office"
         r.pdf_uris.extend(_office_uris(data))
         if r.pdf_uris: r.details.append(f"{len(r.pdf_uris)} link(s)")
+
+    elif data.startswith(b'PK\x03\x04') and not is_valid_office:
+        # Plain ZIP/archive — do NOT run OleTools on it
+        r.file_type = "Archive"
+        r.pdf_uris.extend(_office_uris(data))  # still check for links inside
+        if r.pdf_uris: r.details.append(f"{len(r.pdf_uris)} link(s) inside archive")
+        r.verdict = "Archive file" if not r.yara_matches else f"SUSPICIOUS — {r.yara_matches[0]['rule']}"
+        return r
+
+    if r.file_type == "Office":
         if not OLETOOLS_OK:
             r.verdict = "Macro engine offline"; return r
         try:
@@ -1365,8 +1405,8 @@ def extract_observables(msg, html_body, text_body) -> Tuple[List[Observable], Li
     for ea in PAT_EMAIL.findall(str(msg))[:MAX_OBS]:
         _add('domain', ea.split('@')[1].lower(), 'header')
 
-    # IPs
-    priv = [re.compile(p) for p in [r'^10\.',r'^192\.168\.',r'^127\.',r'^169\.254\.']]
+    # IPs (FIX: was missing 172.16-31 private range)
+    priv = [re.compile(p) for p in [r'^10\.',r'^192\.168\.',r'^172\.(1[6-9]|2\d|3[01])\.',r'^127\.',r'^169\.254\.',r'^0\.']]
     for h in msg.get_all('Received',[]) or []:
         for ip in PAT_IPV4.findall(str(h)):
             if not any(r.match(ip) for r in priv): _add('ip', ip, 'received')
@@ -1597,12 +1637,12 @@ def generate_signals(auth, anomalies, reply_hijack, bec, spoof_result, spoof_dn,
         sigs.append(ThreatSignal('ocr_bec','content',3, 0.35, 0.55,
             "Image-Text BEC", f"OCR detected BEC in {ocr_bec_hits} image(s)",""))
 
-    # ── Sender memory trust ───────────────────────────────────────────────────
+    # ── Sender memory trust (check only — recording happens after clean verdict)
     if auth.from_domain:
-        known, count, days = record_sender(auth.from_domain)
+        known, count, days = check_sender(auth.from_domain)
         if known and days > 30:
             trust.append(TrustFactor('known_sender', min(0.20, days/365*0.20), 0.75,
-                f"Known sender: {auth.from_domain} ({days}d, {count}x)"))
+                f"Known sender: {auth.from_domain} ({days}d, {count} clean emails)"))
 
     return sigs, trust
 
@@ -1877,6 +1917,11 @@ def analyze_email(msg_bytes, status_fn, progress_fn):
 
     # ── Run scoring engine ────────────────────────────────────────────────────
     scoring = run_scoring_engine(signals, trust_factors)
+
+    # Record sender in memory ONLY if verdict is clean
+    # (prevents attackers from building trust via repeated malicious emails)
+    if auth.from_domain:
+        record_sender_if_clean(auth.from_domain, scoring.score < 18)
 
     progress_fn(100)
     status_fn(f"Done! Verdict: {scoring.verdict}", "✅")
