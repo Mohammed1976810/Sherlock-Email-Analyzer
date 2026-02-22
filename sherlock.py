@@ -2450,20 +2450,28 @@ def _safe_strip_www(domain: str) -> str:
     return d
 
 
+_TRACKING_DOMAIN_CACHE: dict = {}
+
 def is_tracking_domain(domain: str) -> bool:
     """Check if domain is a known email tracking/redirect/security gateway service.
     Matches exact domain, root domain, AND parent domain (so sub.trendmicro.com
-    matches trendmicro.com in the allowlist)."""
+    matches trendmicro.com in the allowlist).
+    PERF: Cached — called multiple times per observable across the pipeline."""
     d = _safe_strip_www(domain.lower())
+    if d in _TRACKING_DOMAIN_CACHE:
+        return _TRACKING_DOMAIN_CACHE[d]
     if d in TRACKING_ALLOWLIST:
+        _TRACKING_DOMAIN_CACHE[d] = True
         return True
     root = _root_domain(d)
     if root in TRACKING_ALLOWLIST:
+        _TRACKING_DOMAIN_CACHE[d] = True
         return True
-    # Check if any allowlisted domain is a suffix (parent domain match)
     for allowed in TRACKING_ALLOWLIST:
         if d.endswith('.' + allowed):
+            _TRACKING_DOMAIN_CACHE[d] = True
             return True
+    _TRACKING_DOMAIN_CACHE[d] = False
     return False
 
 
@@ -2645,12 +2653,17 @@ def _esc(t):
     return html.escape(str(t))
 
 
+_ROOT_DOMAIN_CACHE: dict = {}
+
 def _root_domain(d):
     """FIX(C17): Extract registrable domain, handling compound TLDs.
     Original only handled 7 compound TLDs - expanded to 30+ to fix typosquat
-    detection for domains like microsoft.co.za, paypal.com.br, etc."""
+    detection for domains like microsoft.co.za, paypal.com.br, etc.
+    PERF: Results cached — this function is called 10-50x per observable."""
     if not d:
         return d
+    if d in _ROOT_DOMAIN_CACHE:
+        return _ROOT_DOMAIN_CACHE[d]
     p = d.lower().split('.')
     compound_tlds = [
         'co.uk', 'gov.uk', 'ac.uk', 'org.uk', 'net.uk',
@@ -2707,8 +2720,12 @@ def _root_domain(d):
     for cc in compound_tlds:
         if dl.endswith('.' + cc):
             parts_needed = len(cc.split('.')) + 1
-            return '.'.join(p[-parts_needed:])
-    return '.'.join(p[-2:]) if len(p) >= 2 else d
+            result = '.'.join(p[-parts_needed:])
+            _ROOT_DOMAIN_CACHE[d] = result
+            return result
+    result = '.'.join(p[-2:]) if len(p) >= 2 else d
+    _ROOT_DOMAIN_CACHE[d] = result
+    return result
 
 
 def defang(v):
@@ -7979,16 +7996,16 @@ def main():
             sc.empty()
             pb.empty()
 
-            # ── Persist to case DB and fire webhook if needed ─────────────────
             R_new = st.session_state.report
             new_case_id = case_save(R_new, analyst="analyst")
             st.session_state.case_id          = new_case_id
             st.session_state.cache_hit         = False
             st.session_state.force_reanalyze   = False
             st.session_state._analysis_elapsed = round(time.time() - t0, 1)
-            # Fire webhook in background (non-blocking)
             try:
                 soar_j = build_soar_json(R_new, new_case_id)
+                st.session_state["_soar_json"] = json.dumps(soar_j, indent=2, default=str)
+                st.session_state["_soar_json_key"] = f"{R_new['hashes']['md5']}:{new_case_id}"
                 fire_webhook(new_case_id, soar_j)
             except Exception as _we:
                 log.error(f"Webhook prep error: {_we}")
@@ -8249,11 +8266,14 @@ def main():
                 f"<div style='color:{DC['text2']};font-size:.85em'>"
                 f"Analytical insights -- <em>what it means, not just what was found</em></div></div>",
                 unsafe_allow_html=True)
-            try:
-                reason_cards = build_reasoning_cards(R)
-            except Exception as e:
-                log.error(f"Reasoning cards: {e}")
-                reason_cards = []
+            if st.session_state.get("_reason_cards_key") != _report_key:
+                try:
+                    st.session_state["_reason_cards"] = build_reasoning_cards(R)
+                except Exception as e:
+                    log.error(f"Reasoning cards: {e}")
+                    st.session_state["_reason_cards"] = []
+                st.session_state["_reason_cards_key"] = _report_key
+            reason_cards = st.session_state["_reason_cards"]
             for i in range(0, len(reason_cards), 2):
                 cols = st.columns(2)
                 for j, col in enumerate(cols):
@@ -9730,7 +9750,10 @@ def main():
                                    "sherlock_report.txt", "text/plain")
             with ec2:
                 if PDF_REPORT_OK:
-                    pdf = generate_pdf_report(txt)
+                    if st.session_state.get("_pdf_rpt_key") != _report_key:
+                        st.session_state["_pdf_rpt"] = generate_pdf_report(txt)
+                        st.session_state["_pdf_rpt_key"] = _report_key
+                    pdf = st.session_state["_pdf_rpt"]
                     if pdf:
                         st.download_button("\U0001f4e5 Download PDF Report", pdf,
                                            "sherlock_report.pdf", "application/pdf")
@@ -9752,7 +9775,10 @@ def main():
                 f"Auto-populated from analysis data &mdash; fully editable. "
                 f"Edit, copy, and paste directly into your ticketing system or report.</div></div>",
                 unsafe_allow_html=True)
-            analyst_report_text = generate_analyst_report(R)
+            if st.session_state.get("_analyst_rpt_key") != _report_key:
+                st.session_state["_analyst_rpt"] = generate_analyst_report(R)
+                st.session_state["_analyst_rpt_key"] = _report_key
+            analyst_report_text = st.session_state["_analyst_rpt"]
             st.text_area(
                 label="Analyst Report (editable)",
                 value=analyst_report_text,
@@ -9966,11 +9992,15 @@ def main():
                         f"margin-bottom:8px'>\U0001f916 SOAR JSON Payload</div>",
                         unsafe_allow_html=True)
             st.caption("Full structured payload — paste directly into your SOAR playbook or POST to the API.")
-            try:
-                soar_out = build_soar_json(R, current_case_id or "")
-                soar_str = json.dumps(soar_out, indent=2, default=str)
-            except Exception as _sje:
-                soar_str = f"Error building SOAR JSON: {_sje}"
+            _soar_cache_key = f"{_report_key}:{current_case_id or ''}"
+            if st.session_state.get("_soar_json_key") != _soar_cache_key:
+                try:
+                    soar_out = build_soar_json(R, current_case_id or "")
+                    st.session_state["_soar_json"] = json.dumps(soar_out, indent=2, default=str)
+                except Exception as _sje:
+                    st.session_state["_soar_json"] = f"Error building SOAR JSON: {_sje}"
+                st.session_state["_soar_json_key"] = _soar_cache_key
+            soar_str = st.session_state["_soar_json"]
             st.text_area(
                 label="SOAR JSON", value=soar_str, height=400,
                 key="soar_json_area", label_visibility="collapsed"
@@ -10021,7 +10051,11 @@ def main():
             st.markdown(f"<div style='font-size:1.1em;font-weight:700;color:{DC['text1']};"
                         f"margin-bottom:8px'>\U0001f4c2 Recent Cases</div>",
                         unsafe_allow_html=True)
-            recent = case_list(limit=20)
+            _cases_ts = st.session_state.get("_cases_list_ts", 0)
+            if time.time() - _cases_ts > 10 or "_cases_list" not in st.session_state:
+                st.session_state["_cases_list"] = case_list(limit=20)
+                st.session_state["_cases_list_ts"] = time.time()
+            recent = st.session_state["_cases_list"]
             if recent:
                 df_cases = pd.DataFrame(recent)
                 # Truncate long fields for display
