@@ -7402,17 +7402,9 @@ def analyze_email(msg_bytes, status_fn, progress_fn):
 
     if YARA_OK and visible_text:
         body_yara = _yara_scan(visible_text.encode('utf-8', 'ignore'), 'email_body')
-        email_yara = _yara_scan_email(msg_bytes)
-        combined_body_yara = list(body_yara)
-        seen_rules = {y['rule'] for y in combined_body_yara}
-        for ey in email_yara:
-            if ey['rule'] not in seen_rules:
-                combined_body_yara.append(ey)
-                seen_rules.add(ey['rule'])
-        if combined_body_yara:
+        if body_yara:
             bm = MacroResult(filename="[Body]", file_type="HTML/Text",
-                             yara_matches=combined_body_yara,
-                             verdict=f"YARA: {combined_body_yara[0]['rule']}")
+                             yara_matches=body_yara, verdict=f"YARA: {body_yara[0]['rule']}")
             macros.append(bm)
     progress_fn(80)
 
