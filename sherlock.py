@@ -1018,20 +1018,63 @@ _ATTACHMENT_ONLY_RULES = frozenset({
 })
 
 # ── Enrichment-only rules: informational, never contribute to threat score ────
+# These rules fire on benign characteristics. They appear in the YARA tab with
+# an INFO badge but have zero score impact. Rule names verified against triage_rules.yar.
 _ENRICHMENT_RULES = frozenset({
-    # ── Sender/routing context ─────────────────────────────────────────────────
-    'CY_Sender_is_NOREPLY',      # noreply/no-reply — extremely common, not malicious
-    'CY_URL_Redirect',           # url=http — fires on almost every marketing email
-    'PM_SPF_Pass',               # SPF pass is a POSITIVE indicator, not a threat
-    'CY_Mailer_Not_Office_Outlook',  # fires on every Gmail/Thunderbird/Mailchimp/etc.
-    'CY_Mobile_Phone_Text_To_Email', # SMS-to-email gateway, purely informational
+    # ── Auth / routing observations (auth engine handles these with full context) ──
+    'PM_SPF_Pass',               # SPF pass is a POSITIVE signal — not a threat
+    'PM_SPF_Fail',               # Covered by auth engine with DKIM/DMARC context
+    'PM_SPF_Soft_Fail',          # Covered by auth engine
+    'CY_SPF_Neutral',            # SPF neutral — very common on legitimate mail
+
+    # ── Mailer / client identification ─────────────────────────────────────────
+    'CY_Mailer_Not_Office_Outlook',     # fires on Gmail, Thunderbird, Mailchimp, etc.
+    'CY_Mobile_Phone_Text_To_Email',    # SMS-to-email gateway — purely informational
+    'CY_Mailer_Services_API',           # bulk API sender identification
+    'PM_Roundcube_UAS',                 # Roundcube webmail user agent
+    'PM_Email_Sent_By_PHP_Script',      # PHP mailer (also used by legitimate sites)
+
+    # ── Sender / reply-to context (covered independently by auth engine signals) ──
+    'CY_Sender_is_NOREPLY',            # noreply address — extremely common, not malicious
+    'CY_ReplyTo_FreeDomain',           # reply_to_hijack signal covers the real threat
+    'CY_Free_Email_Provider',          # display_name_spoof + auth signals cover real threats
+    'CY_FMR_freemail',                 # freemail context — not standalone threat indicator
+
+    # ── Marketing / bulk email services ────────────────────────────────────────
+    'CY_Campaigner_Marketing',
+    'CY_ConstantContact_Marketing',
+    'CY_GovDelivery_Marketing',
+    'CY_Marketing_MailChimp',
+    'CY_NTEU_marketing_emails',
+    'CY_Survey_Monkey',
+    'CY_UCE_SendGrid',
+    'CY_mailgun',
+    'CY_benchmark_email_marketing',
+    'CY_URL_Redirect',                 # url=http — in every marketing email
+
+    # ── Service identifiers (PM_LABS_ServiceID_* prefix in _ENRICHMENT_PREFIXES) ──
+    # Listed individually as backup in case prefix match doesn't fire
+    'PM_LABS_ServiceID_AmazonSES',
+    'PM_LABS_ServiceID_Cloudmark',
+    'PM_LABS_ServiceID_ConstantContact',
+    'PM_LABS_ServiceID_KnowBe4',       # security awareness training simulator
+    'PM_LABS_ServiceID_LinkedIn',
+    'PM_LABS_ServiceID_Mailgun',
+    'PM_LABS_ServiceID_Marketo',
+    'PM_LABS_ServiceID_Salesforce',
+    'PM_LABS_ServiceID_Sendgrid',
+
+    # ── LEGITIMATE service markers — these confirm clean mail, not threats ──────
+    # CRITICAL: these rules fire when mail is GENUINELY from these services.
+    # Treating them as threats would flag legitimate PayPal receipts, Atlassian invites, etc.
+    'CY_Legitimate_PayPal',            # From/Domain/MessageID all match real PayPal
+    'CY_Legit_Atlassian_invite',       # from noreply@am.atlassian.com with SPF pass
+    'CY_Docusign_Networks',            # legitimate DocuSign routing
+
+    # ── Security simulator domains — phishing awareness training ───────────────
+    'PM_simulator_domains',            # KnowBe4/Cofense/Proofpoint simulator URLs
+
     # ── File format identification (structural, not malicious) ─────────────────
-    # These are handled in _yara_scan() per-attachment with magic-byte guards.
-    # Listing them here ensures _yara_scan_email() treats them as enrichment too.
-
-    # ── Noisy Cofense Rules to Suppress ────────────────────────────────────────
-    'PM_Labs_Potential_Malware_Reply_Chain', # False positive on normal email replies
-
     'PM_pdf_document',           # %PDF- header → every PDF
     'PM_zip_file',               # ZIP magic bytes → every .zip / Office OOXML
     'PM_xlsx_file',              # xl/_rels/ → every valid Excel OOXML
@@ -1042,14 +1085,203 @@ _ENRICHMENT_RULES = frozenset({
     'PM_excel_document',         # OLE2 + Workbook → every valid .xls
     'PM_powerpoint_document',    # OLE2 + PowerPoint → every valid .ppt
     'PM_rtf_file',               # {\rtf at 0 → every valid RTF
-    'CY_PDF_With_Links',         # %PDF- + URI annotation → every PDF with a hyperlink
+    'CY_PDF_With_Links',         # %PDF- + URI → every PDF with a hyperlink
+
+    # ── Noisy contextual rules ──────────────────────────────────────────────────
+    'PM_Labs_Potential_Malware_Reply_Chain',  # FP on every normal reply chain
+    'PM_List_Unsubscribe_Header',             # RFC 2369 — in every newsletter
+    'CY_Spam_to_Open_DistList',              # bulk targeting label — informational
+    'CY_SPAM_Linkedin_networks',             # LinkedIn marketing — informational
+    'CY_Requests_Read_Receipt',              # read receipt — annoying, not malicious
+    'CY_No_Subject',                         # missing subject — legitimate mail has this
+    'CY_JavaMail_SPAM',                      # JavaMail user agent — legitimate in enterprise
+    'CY_PDF_Suspicious_Attributes',            # condition: false — dead rule, never fires
+    'CY_Secure_Email_Services',               # [Secure]/[Encrypt] subject — legitimate secure mail wrappers
+    'PM_WeTransfer_File_Download',            # generic WeTransfer notification strings — too broad
 })
+
 _ENRICHMENT_PREFIXES = (
-    'CY_CofenseLabs_ServiceID_', # gateway identification rules (Proofpoint, Mimecast, etc.)
-    'PM_TNR_',                   # Cofense Triage Noise-Reduction labels — internal classification only
+    'CY_CofenseLabs_ServiceID_', # gateway/security-product identification
+    'PM_TNR_',                   # Cofense Triage Noise-Reduction — internal classification
+    'CY_FMR_',                   # Freemail-sender rules — contextual only
+    'CY_Free_Email_',            # Free email provider identification
+    'CY_FEP_',                   # Free Email Provider (alternate prefix)
+    'PM_LABS_ServiceID_',        # Bulk/marketing service identification
 )
 
-# ── Malware families that warrant CRITICAL severity ───────────────────────────
+# ── Named rules that need CRITICAL severity ───────────────────────────────────
+_CRITICAL_NAMED_RULES = frozenset({
+    # CVE exploits — remote code execution
+    'CY_CVE_2017_11882_Obfuscated', 'CY_CVE_2017_11882_Plaintext',
+    # Shellcode / memory corruption exploits
+    'PM_RTF_Exploit', 'PM_RTF_Exploit_HeapSpray',
+    'PM_EqnEdt32_Shellcode_OLE_Doc', 'PM_EqnEdt32_Shellcode_RTF_Doc',
+    # Named malware campaigns
+    'CY_Remcos_0612202301', 'CY_Remcos_1505202401',
+    'CY_emotet_rfc2822_w_content',
+    'CY_PDC_BazarBackdoor_Campaigns',
+    # BEC threat actor campaigns (named, confirmed)
+    'CY_PDC_BEC_CosmicLynx', 'PM_Labs_Cosmic_Lynx_BEC',
+    # APT actor indicators
+    'PM_APT1_WEBC2_Y21K', 'PM_APT1_letusgo', 'PM_APT1_payloads',
+    'PM_CrowdStrike_PutterPanda_04',
+    # High-confidence dropper techniques
+    'PM_PDF_with_embedded_DOCM',      # PDF dropper → macro-enabled Word doc
+    'PM_Office_Embedded_Flash_Object', # Flash exploit embedded in Office
+})
+
+# ── Named rules that need HIGH severity ───────────────────────────────────────
+_HIGH_NAMED_RULES = frozenset({
+    # Script/code execution in attachments
+    'CY_JS_Attachment',           # .js/.jse — almost never legitimate in email
+    'PM_HTML_VBScript',           # VBScript in HTML body
+    'PM_LNK_PowerShell',          # LNK shortcut running PowerShell (common dropper)
+    'PM_SVG_With_Script',         # SVG with embedded script
+    # Macro/Office-based threats
+    'CY_VBA_Stomp',               # VBA stomping (deobfuscation evasion)
+    'PM_Macro_AutoRun',           # AutoRun macro
+    'PM_OOXML_Macro_Enabled',     # macro-enabled OOXML (.xlsm, .docm, etc.)
+    'PM_docx_macro',              # docx with macro content
+    'PM_Office_Embedded_Object',  # embedded OLE object
+    'PM_PPT_With_OLEObject',      # OLE object in PowerPoint
+    'PM_PowerPoint_Show_Embedded_OLE',
+    'PM_Obfuscated_RTF',          # RTF with obfuscated header
+    'PM_RTF_OLELink',             # RTF with OLE link (remote template)
+    'PM_CustomUI_Element',        # Custom ribbon UI (credential phish prompts)
+    'PM_Embedded_OLE_Package',    # OLE package dropper
+    # Executable / archive delivery
+    'PM_Zip_With_Exe',            # executable in ZIP
+    'PM_Zip_with_js',             # JavaScript in ZIP
+    'PM_rar_with_js',             # JavaScript in RAR
+    'PM_Rar_with_exe',            # executable in RAR
+    'PM_chained_extension',       # double extension (document.pdf.exe)
+    'PM_zip_with_rtlo_exe_scr',   # RTLO character to hide .exe extension
+    'PM_mz_executable',           # raw PE/MZ binary
+    'PM_exe_in_iso',              # executable inside ISO image
+    'PM_Jar_File',                # Java archive (Java exploit delivery)
+    'PM_chm_file',                # CHM help file (exploit vector)
+    'PM_EPS_File',                # EPS PostScript (exploit vector)
+    'PM_ace_file',                # ACE archive (WinAce path traversal exploit)
+    # PDF threats
+    'PM_PDF_With_Embedded_File',  # PDF dropping embedded file
+    # Deliberate obfuscation (not FP-prone — these are specific techniques)
+    'PM_font_size_zero',          # font-size:0 to hide text from humans
+    'PM_VBS_Chr_Obfuscation',     # Chr() obfuscation in VBScript
+    'PM_Long_Chr',                # excessive Chr() calls (obfuscation)
+    'PM_Windows_Script_Encoder',  # WSE-encoded script file
+    'PM_WebToolHub_Obfuscation',  # known online obfuscation tool output
+    'CY_Decimal_Obfuscated_IP_URL',  # decimal-encoded IP in URL (deliberate)
+    'CY_punycode_domain_possible_spoofing',  # punycode homograph domain
+    'PM_Attachment_Spoof',        # file.doc.zip double-extension naming
+    # Extortion / sextortion
+    'CY_Sextortion_Subjects',     # specific sextortion subject line patterns
+    'PM_INTEL_Sextortion_Phish',
+    'PM_DD4BC_Extortion_Attempt',
+    # Brand phishing (specific, verified patterns)
+    'CY_Fake_Paypal',             # PayPal body without legitimate PayPal From
+    'CY_Phishing_USAA_Wire_Transfer',
+    'CY_w2_phishing',             # W-2 form tax phishing
+    'CY_Account_Reset_Scam',
+    'CY_Amex_Account_Access_Resolution_Required',
+    'CY_HSBC_Remittance_copy',
+    'CY_Royal_Bank_of_Canada_Email',
+    'CY_Scotia_Bank_Email',
+    'CY_Re_Activate_Your_Hbl_Online_Access',
+    'PM_KMON_Credential_phish',
+    'PM_html_file_password_solicitation',
+    'PM_UR_CredPhish_273826', 'PM_UR_CredPhish_273837',
+    'PM_UR_Intel_CredPhish_265457',
+    # BEC campaigns (named, specific)
+    'CY_PDC_BEC_198831',
+    'CY_PDC_BEC_Project_Keywords_Updated_16112020',
+    'PM_LABS_BEC_DirectDeposit',
+    'PM_Potential_VistaPrint_BEC_Scam',
+    # Malware delivery (specific campaigns)
+    'CY_Malware_ReceiptOfPayment',
+    'CY_HTML_Malware_Download_20200129',
+    'CY_Kutaki_0915202201',
+    'CY_XXE_with_EXE',
+    'PM_EclipseSunCloudRAT', 'PM_OffensiveWare_RAT_MalDoc',
+    # Quote + Archive = very specific BEC/malware delivery combo
+    'CY_Quote_With_Archive',
+    # Archive delivery with document lures
+    'PM_Zip_With_PDF', 'PM_zip_with_htm',
+    'PM_Zip_With_doc', 'PM_Zip_With_xls', 'PM_Zip_With_ppt',
+    'PM_Rar_with_doc', 'PM_Rar_with_pdf', 'PM_Rar_with_ppt',
+    'PM_Rar_with_xls', 'PM_rar_with_js',
+    # APT Hangover group
+    'PM_Hangover_Appinbot', 'PM_Hangover_Auspo', 'PM_Hangover_Deksila',
+    'PM_Hangover_Foler', 'PM_Hangover_Fuddol', 'PM_Hangover_Gimwup',
+    'PM_Hangover_Iconfall', 'PM_Hangover_Slidewin',
+    'PM_Hangover_Smackdown_Downloader', 'PM_Hangover_Smackdown_various',
+    'PM_Hangover_Tymtin_Degrab', 'PM_Hangover_UpdateEx',
+    'PM_Hangover_Vacrhan_Downloader',
+    # CCREW / other exploit kits
+    'PM_CCREWBACK1', 'PM_ccrewMiniasp', 'PM_ccrewSSLBack1', 'PM_ccrewSSLBack3',
+    'PM_Tran_Duy_Linh_Exploit_Kit',
+    # Crypto-extortion
+    'CY_Bitcoin_Address', 'CY_Bitcoin_Wallet', 'CY_Dashcoin_Wallet',
+    'CY_Ethereum_Wallet', 'CY_Litecoin_Wallet',
+    # Other high-confidence malicious patterns
+    'CY_Malware_ReceiptOfPayment',
+    'PM_LNK_PowerShell',
+    'PM_ms_lnk_file',              # LNK file shortcut
+    'PM_js_file',                  # JavaScript file attachment
+    'PM_CryptoWall_Resume_phish',
+    'PM_Dyre_Delivery',
+    # Properly classified from MEDIUM audit
+    'CY_PDF_with_SCR',             # PDF with URI + .scr reference → dropper
+    'CY_URL_IP_Host',              # URL with bare IP host — almost never legitimate
+    'PM_Labs_XLM_4_Macro',         # Excel 4.0 macro — widely abused malware delivery
+    'PM_Office_With_Macro',        # OLE2 + VBA — macro-enabled Office file
+    'PM_Encrypted_Office_Document',# encrypted Office doc (hides payload from scanners)
+    'PM_Encrypted_Zip_File',       # password-protected ZIP (hides payload)
+    'PM_Ascii_http',               # hex-encoded http:// URL (deliberate obfuscation)
+    'PM_IP_Based_URL',             # http://IP/ format URL (no legit domain)
+    'PM_LABS_Sharepoint_Resignation', # SharePoint credential phish lure
+    'PM_Labs_JNLP',                # Java Network Launch Protocol (Java exploit delivery)
+    'PM_Labs_Zip_in_Zip',          # zip-in-zip evasion technique
+    'PM_MHTML_Document',           # MHTML used in credential phishing
+    'PM_Office_zero_character_count', # zero char count obfuscation
+    'PM_Office_zero_word_count',   # zero word count obfuscation
+    'CY_WeTransfer_Possible_Phishing', # From WeTransfer + download link (specific)
+    'CY_Free_Cloud_Storage',       # cloud storage delivery (GDrive/Dropbox phish)
+    'PM_URL_Shortener',            # URL shortener hiding destination
+    'PM_dynamic_dns_domains',      # dynamic DNS domain (C2 infrastructure)
+})
+
+# ── Named rules that need LOW severity (corroboration required) ───────────────
+_LOW_NAMED_RULES = frozenset({
+    'PM_Unknown_Received_Path',  # unknown relay hop — LOW per audit (no other coverage)
+    'CY_BEC_Aging_Report',       # aging report keyword — LOW per audit
+    'CY_HTML_Meta_Refresh',      # meta refresh — LOW per audit (no other coverage)
+    'PM_Google_Redirect',        # Google redirect (common in legit marketing tracking)
+    'PM_Chinese_Text',           # Chinese text — very FP prone for international orgs
+    'PM_Russian_Link',           # Russian domain link — very FP prone
+    'CY_Received_file_in_Subject',  # "file" in subject — low specificity
+    'PM_criakl_russian_meta_content',
+    'PM_xor_This_program_152', 'PM_xor_This_program_197', 'PM_xor_This_program_222',
+    'PM_xor_This_program_27', 'PM_xor_This_program_65',
+    'PM_ascii_xor_This_program_252', 'PM_ascii_xor_This_program_51',
+    'PM_MiniASP',
+})
+
+# ── Named rules that need CRITICAL severity — additional ─────────────────────
+# Appended separately to avoid redefining the frozenset
+_CRITICAL_NAMED_RULES = _CRITICAL_NAMED_RULES | frozenset({
+    'PM_zeus_tracker',             # Zeus botnet C2 domain blocklist
+    'PM_RTF_Exploit',              # RTF memory corruption exploit
+    'PM_EqnEdt32_Shellcode_OLE_Doc', # Equation Editor shellcode
+})
+
+# ── Malware families that warrant CRITICAL severity via substring match ───────
+# Used by _cofense_severity() for PM_Intel_* and generic PM_* prefix rules that
+# are NOT in the named sets above. These rules follow the naming convention
+# PM_Intel_<FamilyName>_<hash> or PM_<FamilyName>_<variant>, so we check if
+# ANY known family name appears as a substring of the rule name.
+# This is a DIFFERENT mechanism from the named sets: named sets match exact rule
+# names; this set does fuzzy substring matching to catch dynamically-generated
+# Cofense rule names for known malware campaigns.
 _CRITICAL_MALWARE_FAMILIES = frozenset({
     'XWorm', 'Xworm', 'AsyncRAT', 'Async', 'Remcos', 'RemcosRAT',
     'AgentTesla', 'QakBot', 'Emotet', 'TrickBot', 'IcedID', 'Dridex',
@@ -1068,26 +1300,45 @@ _CRITICAL_MALWARE_FAMILIES = frozenset({
 })
 
 def _cofense_severity(rule_name: str, meta: dict) -> str:
-    """Infer severity for any YARA rule. Built-ins carry explicit severity= meta."""
+    """Return severity for any YARA rule, using named-rule lookup tables built from
+    a manual audit of triage_rules.yar. Priority order:
+      1. Explicit severity= meta field (built-in rules only)
+      2. Enrichment check -> INFO (no score impact)
+      3. Named CRITICAL rules (CVE exploits, shellcode, named malware, APTs)
+      4. Named HIGH rules (script execution, macro exploits, brand phish)
+      5. Named LOW rules (noisy/contextual, corroboration required)
+      6. PM_Intel_* -> malware family match=CRITICAL, else HIGH
+      7. CY_PDC_Phish_* / CY_Phish_* -> HIGH
+      8. CY_PDC_* / PM_UR_* -> HIGH
+      9. PM_* -> MEDIUM (changed from HIGH to stop FP storms on file-format rules)
+     10. CY_* -> MEDIUM fallback
+    """
     if 'severity' in meta:
         return meta['severity'].upper()
     if rule_name in _ENRICHMENT_RULES:
         return 'INFO'
     if any(rule_name.startswith(p) for p in _ENRICHMENT_PREFIXES):
         return 'INFO'
-    if rule_name.startswith('PM_Intel_') or rule_name.startswith('PM_'):
+    if rule_name in _CRITICAL_NAMED_RULES:
+        return 'CRITICAL'
+    if rule_name in _HIGH_NAMED_RULES:
+        return 'HIGH'
+    if rule_name in _LOW_NAMED_RULES:
+        return 'LOW'
+    if rule_name.startswith('PM_Intel_'):
         for family in _CRITICAL_MALWARE_FAMILIES:
             if family.lower() in rule_name.lower():
                 return 'CRITICAL'
-        if 'CredPhish' in rule_name or 'UR_CredPhish' in rule_name:
-            return 'HIGH'
         return 'HIGH'
     if rule_name.startswith('CY_PDC_Phish_') or rule_name.startswith('CY_Phish_'):
         return 'HIGH'
-    if rule_name in ('CY_HTML_Meta_Refresh', 'CY_BEC_Aging_Report'):
+    if rule_name.startswith('CY_PDC_') or rule_name.startswith('PM_UR_'):
+        return 'HIGH'
+    if rule_name.startswith('PM_'):
+        for family in _CRITICAL_MALWARE_FAMILIES:
+            if family.lower() in rule_name.lower():
+                return 'CRITICAL'
         return 'MEDIUM'
-    if rule_name.startswith('CY_FMR_'):
-        return 'LOW'
     if rule_name.startswith('CY_'):
         return 'MEDIUM'
     return 'MEDIUM'
@@ -4916,7 +5167,8 @@ def analyze_attachment(data, filename) -> MacroResult:
             r.details.append(f"{len(r.pdf_uris)} URI(s) extracted")
 
         # Verdict: only SUSPICIOUS if genuinely dangerous content detected.
-        r.verdict = "SUSPICIOUS" if (r.yara_matches or r.has_macros) else "SAFE"
+        _threat_yara = [m for m in r.yara_matches if not m.get('enrichment')]
+        r.verdict = "SUSPICIOUS" if (_threat_yara or r.has_macros) else "SAFE"
         return r
 
     # Office (OLE or valid OOXML only -- NOT plain ZIP files)
@@ -4942,8 +5194,9 @@ def analyze_attachment(data, filename) -> MacroResult:
             r.details.append("Result: Verified no malicious executable payloads directly embedded")
         # ----------------------------------------------------------------
             
-        r.verdict = ("Archive file" if not r.yara_matches
-                     else f"SUSPICIOUS -- {r.yara_matches[0]['rule']}")
+        _threat_ym4 = [m for m in r.yara_matches if not m.get('enrichment')]
+        r.verdict = ("Archive file" if not _threat_ym4
+                     else f"SUSPICIOUS -- {_threat_ym4[0]['rule']}")
         return r
     
     if r.file_type == "Office":
@@ -5048,10 +5301,13 @@ def analyze_attachment(data, filename) -> MacroResult:
                     pass
         return r
 
-    if r.yara_matches:
+    _threat_ym5 = [m for m in r.yara_matches if not m.get('enrichment')]
+    if _threat_ym5:
         r.file_type = "Binary"
-        r.verdict = f"SUSPICIOUS -- YARA: {r.yara_matches[0]['rule']}"
+        r.verdict = f"SUSPICIOUS -- YARA: {_threat_ym5[0]['rule']}"
         return r
+    elif r.yara_matches:  # enrichment-only hits — file is not suspicious
+        r.verdict = "SAFE -- informational YARA hits only"
         
     # --- NEW FIX: ALWAYS provide a receipt for other generic files ---
     if not r.details:
@@ -5825,7 +6081,7 @@ def generate_signals(auth, anomalies, reply_hijack, bec, spoof_result, spoof_dn,
     _real_macros = [m for m in macros if m.filename != '[Body]']
     if _real_macros:
         _has_threats = any(
-            m.mb_found or m.yara_matches or (m.has_macros and m.risk_score > 0)
+            m.mb_found or any(y for y in m.yara_matches if not y.get('enrichment')) or (m.has_macros and m.risk_score > 0)
             for m in _real_macros          # <-- only real file attachments
         )
         _has_structural_risks = bool(attachment_risks)
@@ -7446,8 +7702,12 @@ def analyze_email(msg_bytes, status_fn, progress_fn):
     if YARA_OK and visible_text:
         body_yara = _yara_scan(visible_text.encode('utf-8', 'ignore'), 'email_body')
         if body_yara:
+            # Use first non-enrichment rule for the verdict label.
+            _bv_rule = next((y for y in body_yara if not y.get('enrichment')), None)
+            _bv_label = (f"YARA: {_bv_rule['rule']}" if _bv_rule
+                         else "Informational only (no threat rules matched)")
             bm = MacroResult(filename="[Body]", file_type="HTML/Text",
-                             yara_matches=body_yara, verdict=f"YARA: {body_yara[0]['rule']}")
+                             yara_matches=body_yara, verdict=_bv_label)
             macros.append(bm)
 
     # FIX(AUDIT-01): _yara_scan_email() was defined but never called.
@@ -7459,9 +7719,15 @@ def analyze_email(msg_bytes, status_fn, progress_fn):
     if YARA_OK and msg_bytes:
         email_yara = _yara_scan_email(msg_bytes)
         if email_yara:
+            # Pick the first non-enrichment rule for the verdict label so that
+            # informational-only rules (CY_Mailer_Not_Office_Outlook etc.) don't
+            # surface as the verdict when real threat rules are absent.
+            _ev_rule = next((y for y in email_yara if not y.get('enrichment')), None)
+            _ev_label = (f"YARA: {_ev_rule['rule']}" if _ev_rule
+                         else "Informational only (no threat rules matched)")
             em = MacroResult(filename="[Email]", file_type="Raw Email",
                              yara_matches=email_yara,
-                             verdict=f"YARA: {email_yara[0]['rule']}")
+                             verdict=_ev_label)
             macros.append(em)
 
     progress_fn(80)
@@ -7973,7 +8239,7 @@ def main():
                     f"<div style='color:{DC['text2']};font-size:.84em'>Verdict: "
                     f"<b style='color:{_tc(_sim_scoring.threat_level)}'>{_sim_scoring.verdict}</b></div>"
                     f"<div style='color:{DC['text2']};font-size:.80em;margin-top:4px'>"
-                    f"Confidence: {_sim_scoring.analysis_confidence}%</div>"
+                    f"System Confidence: {_sim_scoring.analysis_confidence}%</div>"
                     + (f"<div style='color:{DC['text2']};font-size:.76em;margin-top:4px'>"
                        f"Active clusters: {', '.join(sorted({k for k,v in _detect_clusters(_sim_all_sigs).items()})) or 'none'}"
                        f"</div>" if _detect_clusters(_sim_all_sigs) else "")
@@ -7984,15 +8250,40 @@ def main():
                         for _ss in _sim_extra_sigs:
                             st.markdown(f"- **{_ss.title}** — p={_ss.probability:.0%}, c={_ss.confidence:.0%}")
 
+    # -- The Welcome Screen Columns --
     if not up:
-        st.info("\U0001f446 Upload an .eml file to begin analysis")
+        st.info("👈 Upload an .eml file to begin analysis")
         c1, c2, c3 = st.columns(3)
         with c1:
-            st.markdown("**\U0001f9e0 Signal Engine**\n- Nonlinear scoring\n- Correlation bonuses\n- Signal hierarchy")
+            st.markdown(
+
+                "**🧠 Signal Engine v19**\n"
+                "- Nonlinear probability & density-capped scoring\n"
+                "- Signal hierarchy & pairwise correlations\n"
+                "- Scaled multi-vector threat escalations\n"
+                "- Dominant attack vector extraction\n"
+                "- Phased chronological risk narrative"
+            )
         with c2:
-            st.markdown("**\U0001f50d Smart Detection**\n- BeautifulSoup parsing\n- Text de-obfuscation\n- Link-text mismatch")
+            st.markdown(
+
+                "**🔍 Smart Detection**\n"
+                "- BeautifulSoup parsing & text de-obfuscation\n"
+                "- Link-text mismatch & URL tracking bypass\n"
+                "- Brand-in-subdomain & homoglyph detection\n"
+                "- IP-literal & deep subdomain checks\n"
+                "- Password-protected archive detection"
+            )
         with c3:
-            st.markdown("**\U0001f4ca Complete Analysis**\n- OCR image text\n- pdfminer PDF streams\n- Sender memory")
+            st.markdown(
+
+                "**📊 Complete Analysis**\n"
+                "- Dual-pool parallel threat intelligence\n"
+                "- pikepdf & pdfminer structural/text analysis\n"
+                "- OCR image forensics & steganography\n"
+                "- Corroboration-based confidence scoring\n"
+                "- Scaled sender memory trust & MX validation"
+            )
         return
 
     try:
@@ -8105,6 +8396,7 @@ def main():
         if _is_clean:
             # For clean emails: confidence = "how sure are we it's actually safe?"
             # High = fully authenticated, no signals. Low = no auth data, stray signals.
+            _cert_hdr = "Safety Confidence"
             _ac_color = (DC['ok']   if _ac_val >= 70 else
                          DC['warn'] if _ac_val >= 45 else DC['accent'])
             _ac_label = ("Confirmed Clean"  if _ac_val >= 75 else
@@ -8117,6 +8409,7 @@ def main():
         else:
             # For threat verdicts: confidence = "how well-corroborated is the threat?"
             # Red for weak threat evidence warns analyst this might be a false positive.
+            _cert_hdr = "Verdict Confidence"
             _ac_color = (DC['ok']       if _ac_val >= 70 else
                          DC['warn']     if _ac_val >= 45 else DC['critical'])
             _ac_label = ("Strong"    if _ac_val >= 75 else
@@ -8149,10 +8442,11 @@ def main():
             f"<span style='color:{DC['text2']}'>/100</span></span>"
             f"<span style='color:{DC['text2']};font-size:1.0em'>"
             f"<b>Threat Level</b>&nbsp; <span style='color:{tc};font-weight:600'>{_esc(R['threat_level'])}</span></span>"
-            f"<span style='color:{DC['text2']};font-size:1.0em'>"
-            f"<b>{'Clean Certainty' if _is_clean else 'Evidence Strength'}</b>&nbsp;"
-            f"<span style='color:{_ac_color};font-weight:700'>{_ac_label}</span>"
-            f"&nbsp;<span style='color:{DC['text2']};font-size:.82em'>({_ac_val}% — {_ac_tip})</span>"
+            f"<span style='color:{DC['text2']};font-size:1.0em'"
+            f" title='System Confidence: {_ac_val}% — {_ac_tip}'>"
+            f"<b>{'Safety Confidence' if _is_clean else 'Verdict Confidence'}</b>&nbsp;"
+            f"<span style='color:{_ac_color};font-weight:700'>{_ac_label}</span>&nbsp;"
+            f"<span style='color:{DC['text2']};font-size:.78em;font-style:italic'>ⓘ</span>"
             f"</span></div></div>",
             unsafe_allow_html=True)
 
@@ -8510,22 +8804,11 @@ def main():
             # ── Explain My Score — unified plain-English panel ─────────────────
             # Verdict-aware: clean emails get clean-certainty language;
             # threat verdicts get threat-corroboration language.
+            # _ac_val, _is_clean, _cert_hdr, _ac_color, _ac_label computed above (verdict card).
             sb       = R.get('score_breakdown', {})
-            _ac_val  = R.get('analysis_confidence', R['confidence'])
-            _is_cln  = R['score'] < 18
-
-            if _is_cln:
-                _ac_col  = (DC['ok'] if _ac_val >= 70 else DC['warn'] if _ac_val >= 45 else DC['accent'])
-                _ac_lbl  = ("Confirmed Clean" if _ac_val >= 75 else
-                            ("Likely Clean"   if _ac_val >= 50 else
-                             ("Unverified"    if _ac_val >= 30 else "Inconclusive")))
-                _cert_hdr = "Clean Certainty"
-            else:
-                _ac_col  = (DC['ok'] if _ac_val >= 70 else DC['warn'] if _ac_val >= 45 else DC['critical'])
-                _ac_lbl  = ("Strong"   if _ac_val >= 75 else
-                            ("Moderate" if _ac_val >= 50 else
-                             ("Weak"   if _ac_val >= 30 else "Very Weak")))
-                _cert_hdr = "Evidence Strength"
+            _is_cln  = _is_clean          # alias — same threshold, same value
+            _ac_col  = _ac_color          # alias — avoids re-computing display vars
+            _ac_lbl  = _ac_label          # alias
 
             with st.expander("🔍 Explain My Score", expanded=False):
 
@@ -8556,7 +8839,8 @@ def main():
                                  "Passes basic checks but authentication data is limited."  if _ac_val >= 50 else
                                  "No authentication data — legitimacy cannot be confirmed." if _ac_val >= 30 else
                                  "Insufficient data to confirm safety — treat with caution.")
-                    _cert_line = (f"{_cert_hdr}: <b style='color:{_ac_col}'>{_ac_lbl} ({_ac_val}%)</b>"
+                    _cert_line = (f"{_cert_hdr}: <b style='color:{_ac_col}'>{_ac_lbl}</b>"
+                                  f" <span style='font-size:.92em'>(System Confidence: {_ac_val}%)</span>"
                                   f" — {_cert_tip}")
                 else:
                     _esc_phrase  = (f", boosted by {_n_esc} multi-attack combination{'s' if _n_esc > 1 else ''}"
@@ -8570,7 +8854,8 @@ def main():
                                  "Some evidence supports this verdict."             if _ac_val >= 50 else
                                  "Limited evidence — verify before acting."         if _ac_val >= 30 else
                                  "Minimal evidence — possible false positive.")
-                    _cert_line = (f"{_cert_hdr}: <b style='color:{_ac_col}'>{_ac_lbl} ({_ac_val}%)</b>"
+                    _cert_line = (f"{_cert_hdr}: <b style='color:{_ac_col}'>{_ac_lbl}</b>"
+                                  f" <span style='font-size:.92em'>(System Confidence: {_ac_val}%)</span>"
                                   f" — {_cert_tip}")
 
                 st.markdown(
@@ -8592,17 +8877,22 @@ def main():
                 pre_dmp = sb.get('pre_dampen_score', 0)
                 final_s = sb.get('final_score', _score)
 
-                # Visual step-by-step score flow
+                # Visual step-by-step score flow.
+                # Use pre-computed pts_added / pts_removed from contribution arrays —
+                # both are already in 0-100 pts scale (stored as raw * 100).
+                # DO NOT derive from pre_cls/pre_dmp with a second *100 multiply.
+                _esc_pts   = sum(cc.get('pts_added', 0) for cc in sb.get('cluster_contributions', []))
+                _damp_pts  = sum(dc.get('pts_removed', 0) for dc in sb.get('dampening_contributions', []))
+
                 _step_items = [
                     (f"Detections found ({_n_real} signal{'s' if _n_real != 1 else ''})",
                      f"{pre_cls:.0f} pts", DC['accent'],
                      "Each detection adds risk points based on how serious it is and how certain we are about it."),
                 ]
                 if _n_esc > 0:
-                    _esc_added = pre_dmp - pre_cls
                     _step_items.append((
                         f"Multi-attack bonus ({_n_esc} combination{'s' if _n_esc > 1 else ''} triggered)",
-                        f"+{_esc_added*100:.0f} pts" if _esc_added > 0.005 else "applied",
+                        f"+{_esc_pts:.0f} pts" if _esc_pts >= 0.5 else "applied",
                         DC['warn'],
                         "When multiple types of attacks are used together (e.g. spoofed identity + malware), "
                         "the risk is higher than the sum of parts. A bonus is added."
@@ -8615,10 +8905,9 @@ def main():
                         "Some detections are more suspicious when they appear together. A small extra is added for each pair."
                     ))
                 if _n_damp > 0:
-                    _damp_removed = pre_dmp - final_s / 100 if pre_dmp > 0 else 0
                     _step_items.append((
                         f"Legitimate signals reduced the score ({_n_damp} factor{'s' if _n_damp > 1 else ''})",
-                        f"−{abs(pre_dmp*100 - final_s):.0f} pts",
+                        f"−{_damp_pts:.0f} pts",
                         DC['ok'],
                         "Things like passing SPF, DKIM and DMARC checks are positive signs. They pull the score down."
                     ))
@@ -9418,13 +9707,15 @@ def main():
             # Filter out [Body] pseudo-entry and display real file attachments
             real_macros = [m for m in R['macros'] if m.filename != '[Body]']
             for m in real_macros:
-                # Derive effective risk level from risk_score AND verdict/has_macros.
-                # Before this fix, a PDF with /OpenAction had risk_score=0 (now fixed above),
-                # but we keep this fallback so any future code path can't cause green+SUSPICIOUS.
-                is_suspicious_verdict = m.verdict == 'SUSPICIOUS' or m.has_macros
+                # Derive effective risk level from risk_score AND verdict.
+                # Just having macros doesn't make it suspicious if MacroRaptor cleared them.
+                is_suspicious_verdict = m.verdict and 'SUSPICIOUS' in m.verdict.upper()
                 eff_score = m.risk_score
+                
                 if is_suspicious_verdict and eff_score < 30:
                     eff_score = 30  # Floor: SUSPICIOUS verdict always at least amber
+                elif m.verdict and 'REVIEW' in m.verdict.upper() and eff_score < 20:
+                    eff_score = 20  # Floor: REVIEW verdict gets a light warning
                 mc_color = DC['critical'] if eff_score >= 70 else (DC['high'] if eff_score >= 40 else (DC['warn'] if eff_score >= 30 else DC['ok']))
                 mi = "\U0001f534" if eff_score >= 70 else ("\U0001f7e1" if eff_score >= 40 else ("\U0001f7e0" if eff_score >= 30 else "\U0001f7e2"))
                 # Display label: show effective risk alongside raw score if they differ
@@ -9567,9 +9858,10 @@ def main():
             enrich_hits = [(fn, y) for fn, y in hits if y.get('enrichment')]
 
             if hits:
-                # Summary metrics
+                # Summary metrics — count ALL hits (threat + enrichment/info) so
+                # the Total Hits number matches the per-severity breakdown.
                 sev_counts = {}
-                for _, y in threat_hits:
+                for _, y in hits:
                     sev_counts[y['severity']] = sev_counts.get(y['severity'], 0) + 1
                 c1, c2, c3, c4, c5 = st.columns(5)
                 c1.metric("Total Hits", len(hits))
